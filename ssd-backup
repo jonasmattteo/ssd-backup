@@ -376,9 +376,15 @@ cmd_run() {
   # Automatik pausiert? (manueller Start geht trotzdem)
   (( ! force )) && [[ -f "$STATE_DIR/paused" ]] && exit 0
 
-  # Mindestabstand – außer eine Reparatur steht noch aus
+  # Mindestabstand – außer eine Reparatur steht noch aus. Steht nur eine
+  # (wegen Einhängen) übersprungene Prüfung aus, wird nur diese nachgeholt.
+  local check_only=0
   if (( ! force )) && [[ -f "$STATE_DIR/last_success" && ! -f "$STATE_DIR/needs_repair" ]]; then
-    (( ( $(now) - $(cat "$STATE_DIR/last_success") ) / 3600 < MIN_HOURS_BETWEEN )) && exit 0
+    if (( ( $(now) - $(cat "$STATE_DIR/last_success") ) / 3600 < MIN_HOURS_BETWEEN )); then
+      [[ -f "$STATE_DIR/needs_check" ]] || exit 0
+      backup_is_mounted && exit 0      # immer noch eingehängt → später
+      check_only=1
+    fi
   fi
 
   # Nur ein Lauf gleichzeitig
@@ -417,6 +423,24 @@ cmd_run() {
     sleep 60
   done
   remove_stale_locks >/dev/null
+
+  # --- nur die übersprungene Prüfung nachholen (kein neues Backup) --------
+  if (( check_only )); then
+    log "Übersprungene Prüfung wird nachgeholt"
+    verify_repo; local v=$?
+    if (( v == 0 || v == 4 )); then
+      (( v == 0 )) && rm -f "$STATE_DIR/needs_check"
+      # Anzeige wieder auf das letzte Backup setzen
+      S=(); [[ -f "$STATE_DIR/last_run" ]] && source "$STATE_DIR/last_run"
+      (( v == 0 )) && { S[state]=ok; S[message]=""; }
+      save_status
+      (( v == 0 )) && { cp "$STATUS_FILE" "$STATE_DIR/last_run"; cp "$STATUS_FILE.json" "$STATE_DIR/last_run.json"; }
+      log "=== Prüfung $( (( v == 0 )) && print ok || print 'weiterhin gesperrt' )"
+      exit 0
+    fi
+    # Probleme gefunden → normaler Lauf mit Reparatur
+    rm -f "$STATE_DIR/needs_check"; touch "$STATE_DIR/needs_repair"
+  fi
 
   # --- ausstehende Reparatur aus einem früheren Lauf zuerst erledigen -----
   if [[ -f "$STATE_DIR/needs_repair" ]]; then
@@ -462,15 +486,15 @@ cmd_run() {
     (( r == 3 )) && fail "SSD wurde während der Reparatur entfernt – wird beim nächsten Einstecken fortgesetzt"
     (( r != 0 )) && fail "Backup auf pCloud beschädigt, Reparatur fehlgeschlagen – nächster Versuch in 1 Std."
   elif (( v == 4 )); then
-    # Backup selbst ist durch – nur die Prüfung holen wir beim nächsten Lauf nach
-    touch "$STATE_DIR/needs_repair"
+    # Backup selbst ist durch – nur die Prüfung holen wir nach dem Aushängen nach
+    touch "$STATE_DIR/needs_check"
     log "WARNUNG: $(locked_msg)"
     final_state=warning final_msg="Gesichert, aber Prüfung/Reparatur übersprungen: $(locked_msg)"
   elif (( v == 2 )); then
     touch "$STATE_DIR/needs_repair"
     fail "Prüfung meldet Fehler, die nicht automatisch reparierbar sind – siehe Log"
   fi
-  (( v == 4 )) || rm -f "$STATE_DIR/needs_repair"
+  (( v == 4 )) || rm -f "$STATE_DIR/needs_repair" "$STATE_DIR/needs_check"
   date +%s > "$STATE_DIR/last_success"
 
   # --- Aufräumen ---------------------------------------------------------
@@ -478,7 +502,9 @@ cmd_run() {
       --keep-daily $KEEP_DAILY --keep-weekly $KEEP_WEEKLY
       --keep-monthly $KEEP_MONTHLY --keep-yearly $KEEP_YEARLY)
   S[state]=running; S[phase]=cleanup; save_status
-  if (( $(stamp_age_days "$STATE_DIR/last_prune") >= PRUNE_EVERY_DAYS )); then
+  if (( v == 4 )); then
+    log "Aufräumen übersprungen (Backup ist eingehängt)"
+  elif (( $(stamp_age_days "$STATE_DIR/last_prune") >= PRUNE_EVERY_DAYS )); then
     log "Alte Stände entfernen + prune"
     restic forget "${forget_args[@]}" --prune >> "$LOG_FILE" 2>&1 \
       && date +%s > "$STATE_DIR/last_prune" || log "WARNUNG: forget/prune fehlgeschlagen"
