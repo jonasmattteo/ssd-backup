@@ -1,7 +1,8 @@
 # SSD-Backup → pCloud (verschlüsselt, automatisch)
 
-Sichert eine externe SSD mit **restic** (Verschlüsselung + Versionen) über
-**rclone** nach pCloud. **launchd** startet das Backup automatisch.
+Sichert externe Platten, interne Platten oder einzelne Ordner mit **restic**
+(Verschlüsselung + Versionen) über **rclone** nach pCloud. **launchd** startet
+das Backup automatisch.
 
 ## Einrichten / Aktualisieren
 
@@ -15,7 +16,8 @@ Passwort, SSD-Name, Ordnerlisten) bleibt erhalten.
 **Passwort zusätzlich im Passwort-Manager sichern.** Ohne es ist das Backup
 unlesbar – auch für pCloud.
 
-> Scheitert das automatische Backup mit „Operation not permitted“:
+> Scheitert das automatische Backup mit „Operation not permitted“ (betrifft vor
+> allem interne Ordner wie Dokumente oder Schreibtisch):
 > Systemeinstellungen → Datenschutz & Sicherheit → **Festplattenvollzugriff**
 > → `/bin/zsh` hinzufügen.
 
@@ -24,11 +26,13 @@ unlesbar – auch für pCloud.
 Der Installer baut eine kleine App für die Menüleiste (`~/Applications/SSD-Backup.app`)
 und startet sie beim Anmelden. Ein Klick auf das Laufwerk-Symbol oben rechts zeigt:
 
-- Zustand, Fortschritt mit Restzeit, letztes Backup, angesteckt ja/nein
-- **Backup starten** / **Abbrechen** (bereits Hochgeladenes bleibt erhalten)
+- Zustand, Fortschritt mit Restzeit und welche Quelle gerade gesichert wird
+- alle Quellen mit angesteckt ja/nein, letztem Backup und ▶︎ zum Einzeln-Sichern
+- **Backup starten** (alle verfügbaren Quellen) / **Abbrechen** (bereits Hochgeladenes bleibt erhalten)
 - **Durchstöbern**: hängt das Backup im Finder ein und öffnet die Übersicht aller Stände;
   ⏏︎ hängt es wieder aus
-- **Ordner …**: gesicherte und ausgeschlossene Ordner per Finder-Auswahl verwalten
+- **Quellen & Ordner …**: Platten/Ordner hinzufügen (+) oder entfernen (−), je Quelle
+  gesicherte und ausgeschlossene Ordner per Finder-Auswahl verwalten
 - **Protokoll**, ⚙︎ für Automatik pausieren, Autostart und **Einstellungen**
   (Zeitplan, Mindestabstand, Aufbewahrung, Mitteilungen, gleichzeitige Uploads)
 
@@ -77,12 +81,38 @@ Zusätzlich gibt es macOS-Mitteilungen bei Start, 25/50/75 %, Ende und Fehler
 (abschaltbar in `settings.conf`). Ist das letzte Backup älter als 7 Tage,
 weist die Statusanzeige darauf hin.
 
-## Ordner auswählen oder ausschließen
+## Mehrere Platten oder Ordner (Quellen)
 
-Ohne Angabe öffnet sich ein **Finder-Dialog** (Mehrfachauswahl mit ⌘).
+Jede Quelle ist eine Platte oder ein Ordner. Alle landen im selben
+verschlüsselten pCloud-Backup (ein Passwort, gleiche Dateien werden nur einmal
+hochgeladen), jede mit eigenem Stichwort, eigener Ordnerliste und eigenem
+„zuletzt gesichert“.
 
 ```bash
-ssd-backup include add              # nur bestimmte Ordner sichern
+ssd-backup sources                          # alle Quellen anzeigen
+ssd-backup source add                       # Finder-Dialog: Platte oder Ordner wählen
+ssd-backup source add "/Volumes/Archiv"     # externe Platte
+ssd-backup source add ~/Documents           # interner Ordner
+ssd-backup source add /                     # ganze interne Platte (ohne System/Caches)
+ssd-backup source disable archiv            # vorübergehend nicht automatisch sichern
+ssd-backup source remove archiv             # entfernen (Stände in pCloud bleiben)
+ssd-backup start archiv                     # nur diese Quelle jetzt sichern
+```
+
+- Externe Platten werden gesichert, wenn sie angesteckt sind; interne Quellen
+  sind immer da und laufen nach dem Zeitplan mit.
+- Der Mindestabstand (`MIN_HOURS_BETWEEN`) gilt je Quelle.
+- Beim Durchstöbern zeigt `tags/<stichwort>/` die Stände einer einzelnen Quelle.
+- Bei einem Update wird die bisherige SSD zur ersten Quelle und behält das Stichwort `ssd`,
+  damit ihre Versionsgeschichte weiterläuft.
+
+## Ordner auswählen oder ausschließen
+
+Gilt je Quelle – mit `-s ID` wählen (ohne Angabe: die erste Quelle). Ohne
+Ordnerangabe öffnet sich ein **Finder-Dialog** (Mehrfachauswahl mit ⌘).
+
+```bash
+ssd-backup include -s meinessd add   # nur bestimmte Ordner sichern
 ssd-backup include add Fotos "Projekte/2026"
 ssd-backup exclude add              # Ordner ausschließen
 ssd-backup exclude add "Filme/Rohmaterial" "*.tmp" "**/node_modules"
@@ -93,20 +123,20 @@ ssd-backup edit                     # Einstellungen + Listen im Texteditor
 ```
 
 Regeln:
-- **include leer** → die ganze SSD wird gesichert.
-- **exclude ohne `* ? [ ]`** → genauer Pfad relativ zur SSD.
-- **exclude mit `* ? [ ]`** → Muster, gilt überall auf der SSD.
+- **include leer** → die ganze Quelle wird gesichert.
+- **exclude ohne `* ? [ ]`** → genauer Pfad relativ zur Quelle.
+- **exclude mit `* ? [ ]`** → Muster, gilt überall in der Quelle.
 - Eine leere Datei **`.nobackup`** in einem Ordner schließt ihn ebenfalls aus.
 - Änderungen gelten ab dem nächsten Backup. Bereits gesicherte Daten werden
   nicht neu hochgeladen (Deduplizierung).
 
-Die Dateien liegen in `~/.config/ssd-backup/`:
-`settings.conf`, `include.txt`, `exclude.txt`.
+Die Dateien liegen in `~/.config/ssd-backup/`: `settings.conf` und je Quelle
+`sources/<id>/source.conf`, `include.txt`, `exclude.txt`.
 
 ## Wann läuft das Backup?
 
-- Sobald die SSD eingesteckt wird, **und**
-- stündlich, solange sie angesteckt ist. So werden abgebrochene oder
+- Sobald eine Platte eingesteckt wird, **und**
+- stündlich (für angesteckte Platten und interne Quellen). So werden abgebrochene oder
   fehlgeschlagene Backups (Internet weg, Mac im Ruhezustand) nachgeholt,
 - aber nach einem erfolgreichen Backup erst wieder nach 20 Stunden
   (`MIN_HOURS_BETWEEN`).

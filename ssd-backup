@@ -10,7 +10,8 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 CONF_DIR="$HOME/.config/ssd-backup"
 SETTINGS="$CONF_DIR/settings.conf"
-INCLUDE_FILE="$CONF_DIR/include.txt"
+SOURCES_DIR="$CONF_DIR/sources"         # eine Unterordner pro Quelle (Platte/Ordner)
+INCLUDE_FILE="$CONF_DIR/include.txt"    # nur noch für die Übernahme alter Einstellungen
 EXCLUDE_FILE="$CONF_DIR/exclude.txt"
 STATE_DIR="$HOME/Library/Application Support/ssd-backup"
 STATUS_FILE="$STATE_DIR/status"
@@ -21,7 +22,10 @@ LOCK_DIR="$STATE_DIR/lock"
 SYSTEM_EXCLUDES=(
   ".Spotlight-V100" ".Trashes" ".fseventsd" ".TemporaryItems"
   ".DocumentRevisions-V100" ".restic-cache" ".DS_Store"
+  "$HOME/restic-mount" "$HOME/Library/Caches" "$HOME/.Trash"
 )
+# zusätzlich, wenn eine Quelle die ganze interne Platte ("/") ist
+ROOT_EXCLUDES=(/Volumes /System /dev /private/var/vm /private/var/folders /cores /Library/Caches)
 
 # ---------------------------------------------------------------------------
 #  Konfiguration (wird beim ersten Aufruf mit Standardwerten angelegt)
@@ -53,32 +57,174 @@ SCHEDULE="interval"              # interval | daily | none
 INTERVAL_HOURS=1                 # bei interval: alle X Stunden versuchen
 DAILY_TIME="03:00"               # bei daily: Uhrzeit
 EOF
-  [[ -f "$INCLUDE_FILE" ]] || cat > "$INCLUDE_FILE" <<'EOF'
-# Ordner, die gesichert werden – ein Ordner pro Zeile, relativ zur SSD.
-# Ist diese Liste leer, wird die GANZE SSD gesichert.
+  # Standardwerte für Einstellungen, die in älteren settings.conf fehlen
+  RUN_ON_MOUNT=1 SCHEDULE=interval INTERVAL_HOURS=1 DAILY_TIME="03:00"
+  source "$SETTINGS"
+  export RESTIC_REPOSITORY="rclone:${RCLONE_REMOTE}:${REPO_PATH}"
+  export RESTIC_PASSWORD_COMMAND="${PASSWORD_COMMAND:-security find-generic-password -a $USER -s $KEYCHAIN_SERVICE -w}"
+  migrate_sources
+
+  # Cache auf der ersten angesteckten externen Quelle statt intern – ist keine
+  # angesteckt (z. B. beim Durchstöbern), einen Cache im Library-Ordner verwenden
+  export RESTIC_CACHE_DIR="$HOME/Library/Caches/ssd-backup-restic"
+  local id
+  for id in $(source_ids); do
+    load_source "$id" || continue
+    if src_external && src_present; then export RESTIC_CACHE_DIR="$SRC_ROOT/.restic-cache"; break; fi
+  done
+}
+
+# ---------------------------------------------------------------------------
+#  Quellen (Platten oder Ordner, die gesichert werden)
+#    ~/.config/ssd-backup/sources/<id>/source.conf   NAME, ROOT, TAG, ENABLED
+#                                    /include.txt, /exclude.txt
+#    ~/Library/Application Support/ssd-backup/sources/<id>/   last_success, last_run(.json)
+# ---------------------------------------------------------------------------
+source_ids() {
+  local d
+  for d in "$SOURCES_DIR"/*(N/); do [[ -f "$d/source.conf" ]] && print -r -- "${d:t}"; done
+}
+
+load_source() {   # setzt SRC_ID, SRC_NAME, SRC_ROOT, SRC_TAG, SRC_ENABLED, SRC_INCLUDE, SRC_EXCLUDE, SRC_STATE
+  local f="$SOURCES_DIR/$1/source.conf"
+  [[ -n "$1" && -f "$f" ]] || return 1
+  local NAME="" ROOT="" TAG="" ENABLED=1
+  source "$f"
+  SRC_ID=$1 SRC_NAME=${NAME:-$1} SRC_ROOT=$ROOT SRC_TAG=${TAG:-$1} SRC_ENABLED=${ENABLED:-1}
+  SRC_INCLUDE="$SOURCES_DIR/$1/include.txt" SRC_EXCLUDE="$SOURCES_DIR/$1/exclude.txt"
+  SRC_STATE="$STATE_DIR/sources/$1"
+  mkdir -p "$SRC_STATE"
+}
+
+src_present()  { [[ -n "$SRC_ROOT" && -d "$SRC_ROOT" ]]; }
+src_external() { [[ "$SRC_ROOT" == /Volumes/* ]]; }
+src_kind()     { src_external && print -r -- "extern" || print -r -- "intern"; }
+
+dq() { local v=${1//\\/\\\\}; v=${v//\"/\\\"}; v=${v//\$/\\\$}; v=${v//\`/\\\`}; print -r -- "\"$v\""; }
+
+write_source() {  # write_source ID NAME ROOT TAG [ENABLED]
+  local dir="$SOURCES_DIR/$1"
+  mkdir -p "$dir"
+  {
+    print "# Quelle für ssd-backup"
+    print -r -- "NAME=$(dq "$2")"
+    print -r -- "ROOT=$(dq "$3")"
+    print -r -- "TAG=$(dq "$4")"
+    print -r -- "ENABLED=${5:-1}"
+  } > "$dir/source.conf"
+  [[ -f "$dir/include.txt" ]] || cat > "$dir/include.txt" <<'EOF'
+# Ordner, die gesichert werden – ein Ordner pro Zeile, relativ zur Quelle.
+# Ist diese Liste leer, wird die GANZE Quelle gesichert.
 # Beispiel:
 #   Fotos
 #   Projekte/2026
 EOF
-  [[ -f "$EXCLUDE_FILE" ]] || cat > "$EXCLUDE_FILE" <<'EOF'
+  [[ -f "$dir/exclude.txt" ]] || cat > "$dir/exclude.txt" <<'EOF'
 # Ordner/Dateien, die NICHT gesichert werden – einer pro Zeile.
-#   Ohne * ? [ ]  → Pfad relativ zur SSD, z. B.:  Filme/Rohmaterial
+#   Ohne * ? [ ]  → Pfad relativ zur Quelle, z. B.:  Filme/Rohmaterial
 #   Mit  * ? [ ]  → Muster, gilt überall, z. B.:  *.tmp   **/node_modules
 # Tipp: Eine leere Datei ".nobackup" in einem Ordner schließt ihn ebenfalls aus.
 EOF
-  # Standardwerte für Einstellungen, die in älteren settings.conf fehlen
-  RUN_ON_MOUNT=1 SCHEDULE=interval INTERVAL_HOURS=1 DAILY_TIME="03:00"
-  source "$SETTINGS"
-  SSD="/Volumes/$SSD_NAME"
-  export RESTIC_REPOSITORY="rclone:${RCLONE_REMOTE}:${REPO_PATH}"
-  export RESTIC_PASSWORD_COMMAND="${PASSWORD_COMMAND:-security find-generic-password -a $USER -s $KEYCHAIN_SERVICE -w}"
-  # Cache auf der SSD statt intern – ist sie nicht angesteckt (z. B. beim
-  # Durchstöbern), einen kleinen Cache im Benutzer-Library-Ordner verwenden
-  if [[ -d "$SSD" ]]; then
-    export RESTIC_CACHE_DIR="$SSD/.restic-cache"
+}
+
+slugify() {
+  local s; s=$(print -r -- "$1" | iconv -f UTF-8 -t ASCII//TRANSLIT 2>/dev/null || print -r -- "$1")
+  s=$(print -r -- "$s" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//')
+  print -r -- "${s:-quelle}"
+}
+
+# Einrichtung aus der Version mit nur einer SSD übernehmen (einmalig)
+migrate_sources() {
+  [[ -d "$SOURCES_DIR" ]] && return
+  mkdir -p "$SOURCES_DIR"
+  [[ -n "$SSD_NAME" && "$SSD_NAME" != "MeineSSD" ]] || return
+  local id; id=$(slugify "$SSD_NAME")
+  # Stichwort "ssd" beibehalten, damit die bisherigen Stände weitergeführt werden
+  write_source "$id" "$SSD_NAME" "/Volumes/$SSD_NAME" ssd
+  [[ -f "$INCLUDE_FILE" ]] && mv "$INCLUDE_FILE" "$SOURCES_DIR/$id/include.txt"
+  [[ -f "$EXCLUDE_FILE" ]] && mv "$EXCLUDE_FILE" "$SOURCES_DIR/$id/exclude.txt"
+  mkdir -p "$STATE_DIR/sources/$id"
+  local f; for f in last_success last_run last_run.json; do
+    [[ -f "$STATE_DIR/$f" ]] && cp "$STATE_DIR/$f" "$STATE_DIR/sources/$id/$f"
+  done
+  log "Einstellungen übernommen: Quelle '$SSD_NAME' ($id)"
+}
+
+# Quelle für include/exclude wählen:  -s ID | --source ID, sonst die erste
+select_source() {
+  local want=""
+  if [[ "$1" == (-s|--source) ]]; then want=$2; fi
+  local -a ids; ids=($(source_ids))
+  (( ${#ids} )) || { print "Noch keine Quelle eingerichtet – ssd-backup source add" >&2; return 1; }
+  if [[ -n "$want" ]]; then
+    load_source "$want" || {
+      local id; for id in $ids; do load_source "$id" && [[ "$SRC_NAME" == "$want" ]] && return 0; done
+      print "Unbekannte Quelle: $want  (ssd-backup sources)" >&2; return 1; }
   else
-    export RESTIC_CACHE_DIR="$HOME/Library/Caches/ssd-backup-restic"
+    load_source "${ids[1]}"
+    (( ${#ids} > 1 )) && print "(Quelle: $SRC_NAME – andere mit -s ID wählen, siehe: ssd-backup sources)" >&2
   fi
+  return 0
+}
+
+cmd_source() {
+  local action=${1:-list}; (( $# )) && shift
+  local id
+  case $action in
+    list|ls|"")
+      local -a ids; ids=($(source_ids))
+      (( ${#ids} )) || { print "Noch keine Quelle eingerichtet – ssd-backup source add"; return; }
+      local st
+      for id in $ids; do
+        load_source "$id"
+        st="nicht verfügbar"; src_present && { src_external && st="angesteckt" || st="vorhanden"; }
+        (( SRC_ENABLED )) || st="$st, deaktiviert"
+        printf "  %-18s %-22s %s  (%s, %s)\n" "$id" "$SRC_NAME" "$SRC_ROOT" "$(src_kind)" "$st"
+      done ;;
+    add)
+      local dir=$1 name=$2
+      if [[ -z "$dir" ]]; then
+        dir=$(osascript -e 'POSIX path of (choose folder with prompt "Platte oder Ordner wählen, der gesichert werden soll:" default location (POSIX file "/Volumes"))' 2>/dev/null) \
+          || { print "Nichts ausgewählt."; return 1; }
+      fi
+      [[ "$dir" != "/" ]] && dir=${dir%/}
+      [[ -d "$dir" ]] || { print "Ordner nicht gefunden: $dir" >&2; return 1; }
+      dir=${dir:A}
+      # /Volumes/Macintosh HD ist ein Verweis auf "/"
+      [[ "$dir" == /Volumes/* && "$(stat -f %d "$dir")" == "$(stat -f %d /)" && "$dir" == /Volumes/*([^/]) ]] && dir="/"
+      for id in $(source_ids); do
+        load_source "$id"; [[ "$SRC_ROOT" == "$dir" ]] && { print "Schon als Quelle eingerichtet: $SRC_NAME ($id)"; return 0; }
+      done
+      if [[ -z "$name" ]]; then
+        if [[ "$dir" == "/" ]]; then name="Macintosh HD"
+        elif [[ "$dir" == /Volumes/* ]]; then name=${${dir#/Volumes/}%%/*}; [[ "$dir" == /Volumes/*/* ]] && name="$name – ${dir:t}"
+        else name=${dir:t}; fi
+      fi
+      id=$(slugify "$name"); local base=$id n=2
+      while [[ -d "$SOURCES_DIR/$id" ]]; do id="$base-$n"; (( n++ )); done
+      write_source "$id" "$name" "$dir" "$id"
+      log "Quelle hinzugefügt: $name ($dir)"
+      print "Quelle hinzugefügt: $name  ($dir, ID: $id)"
+      [[ "$dir" == "/" ]] && print "  Tipp: Mit 'ssd-backup include add -s $id' nur bestimmte Ordner sichern."
+      [[ "$dir" != /Volumes/* ]] && print "  Hinweis: Für interne Ordner braucht /bin/zsh evtl. Festplattenvollzugriff (siehe README)."
+      return 0 ;;
+    remove|rm)
+      load_source "$1" || { print "Unbekannte Quelle: $1  (ssd-backup sources)" >&2; return 1; }
+      rm -rf -- "$SOURCES_DIR/$SRC_ID" "$STATE_DIR/sources/$SRC_ID"
+      log "Quelle entfernt: $SRC_NAME ($SRC_ROOT)"
+      print "Quelle entfernt: $SRC_NAME. Bereits gesicherte Stände bleiben in pCloud erhalten."
+      return 0 ;;
+    enable|disable)
+      load_source "$1" || { print "Unbekannte Quelle: $1" >&2; return 1; }
+      write_source "$SRC_ID" "$SRC_NAME" "$SRC_ROOT" "$SRC_TAG" $([[ $action == enable ]] && print 1 || print 0)
+      print "$SRC_NAME: $([[ $action == enable ]] && print aktiviert || print deaktiviert)" ;;
+    rename)
+      load_source "$1" || { print "Unbekannte Quelle: $1" >&2; return 1; }
+      [[ -n "$2" ]] || { print "Aufruf: ssd-backup source rename ID NEUER-NAME" >&2; return 1; }
+      write_source "$SRC_ID" "$2" "$SRC_ROOT" "$SRC_TAG" "$SRC_ENABLED"
+      print "Umbenannt: $2" ;;
+    *) print "Unbekannt: $action  (list | add [PFAD] [NAME] | remove ID | enable ID | disable ID | rename ID NAME)"; return 1 ;;
+  esac
 }
 
 # Alle restic-Aufrufe mit begrenzter Zahl paralleler pCloud-Verbindungen
@@ -131,6 +277,18 @@ save_status() {
 }
 load_status() { S=(); [[ -f "$STATUS_FILE" ]] && source "$STATUS_FILE"; }
 
+# Aktuellen Status S zusätzlich unter <datei> und <datei>.json ablegen
+dump_status() {
+  print -r -- "typeset -gA S=( ${(@kvqq)S} )" > "$1"
+  jq -n '$ARGS.positional as $a | reduce range(0; $a|length; 2) as $i ({}; .[$a[$i]] = $a[$i+1])' \
+     --args "${(@kv)S}" > "$1.json" 2>/dev/null
+}
+
+worse() {   # schlechterer von zwei Zuständen
+  local -A r=(ok 0 warning 1 error 2)
+  (( ${r[$2]:-0} > ${r[$1]:-0} )) && print $2 || print $1
+}
+
 # Liste lesen (ohne Kommentare/Leerzeilen, ohne führende/abschließende / )
 read_list() {
   local line
@@ -146,10 +304,10 @@ read_list() {
 # ---------------------------------------------------------------------------
 #  Ordner-Listen verwalten:  ssd-backup include|exclude add|remove|list
 # ---------------------------------------------------------------------------
-pick_folders() {   # Finder-Dialog, liefert Pfade relativ zur SSD
-  [[ -d "$SSD" ]] || { print "SSD '$SSD_NAME' ist nicht angesteckt." >&2; return 1; }
+pick_folders() {   # Finder-Dialog, liefert Pfade relativ zur Quelle
+  src_present || { print "'$SRC_NAME' ist nicht verfügbar (nicht angesteckt?)." >&2; return 1; }
   osascript <<EOF 2>/dev/null
-set picked to choose folder with prompt "Ordner auf $SSD_NAME wählen (Mehrfachauswahl mit ⌘):" default location (POSIX file "$SSD") with multiple selections allowed
+set picked to choose folder with prompt "Ordner in $SRC_NAME wählen (Mehrfachauswahl mit ⌘):" default location (POSIX file "$SRC_ROOT") with multiple selections allowed
 set out to ""
 repeat with f in picked
   set out to out & POSIX path of f & linefeed
@@ -158,19 +316,23 @@ return out
 EOF
 }
 
-to_relative() {    # absoluter Pfad → relativ zur SSD (oder unverändert)
-  local p="${1%/}" root="${SSD:A}"
+to_relative() {    # absoluter Pfad → relativ zur Quelle (oder unverändert)
+  local p="${1%/}" root="${SRC_ROOT:A}"
+  [[ "$root" == "/" ]] && root=""
   if [[ "$p" == /* ]]; then
     p="${p:A}"
-    [[ "$p" == "$root"/* ]] || { print "Nicht auf der SSD: $1" >&2; return 1; }
+    [[ "$p" == "$root"/* ]] || { print "Nicht in $SRC_NAME: $1" >&2; return 1; }
     p="${p#$root/}"
   fi
   print -r -- "$p"
 }
 
 manage_list() {
-  local kind=$1 action=$2; shift 2
-  local file; [[ $kind == include ]] && file=$INCLUDE_FILE || file=$EXCLUDE_FILE
+  local kind=$1; shift
+  if [[ "$1" == (-s|--source) ]]; then select_source "$1" "$2" || return 1; shift 2
+  else select_source || return 1; fi
+  local action=$1; (( $# )) && shift
+  local file; [[ $kind == include ]] && file=$SRC_INCLUDE || file=$SRC_EXCLUDE
   local label; [[ $kind == include ]] && label="Gesicherte Ordner" || label="Ausgeschlossen"
   local -a items current
   current=("${(@f)$(read_list "$file")}"); current=(${current:#})
@@ -187,7 +349,7 @@ manage_list() {
         if (( ${current[(Ie)$rel]} )); then print "  = $rel (schon in der Liste)"
         else
           print -r -- "$rel" >> "$file"; current+=("$rel"); print "  + $rel"
-          [[ "$rel" != *[\*\?\[]* && ! -e "$SSD/$rel" ]] && print "    ⚠︎ existiert (noch) nicht auf der SSD"
+          [[ "$rel" != *[\*\?\[]* && ! -e "${SRC_ROOT%/}/$rel" ]] && print "    ⚠︎ existiert (noch) nicht in $SRC_NAME"
         fi
       done ;;
     remove|rm)
@@ -206,32 +368,33 @@ manage_list() {
         else print "  ? $rel ist nicht in der Liste"; fi
       done ;;
     list|"")
-      print "$label ($file):"
+      print "$label – $SRC_NAME ($file):"
       if (( ${#current} )); then printf "  • %s\n" "${current[@]}"
-      elif [[ $kind == include ]]; then print "  (leer → die ganze SSD wird gesichert)"
+      elif [[ $kind == include ]]; then print "  (leer → die ganze Quelle wird gesichert)"
       else print "  (keine eigenen Ausschlüsse)"; fi ;;
     *) print "Unbekannt: $action  (add | remove | list)"; return 1 ;;
   esac
 }
 
-# Argumente für restic aus den Listen bauen
+# Argumente für restic aus den Listen der aktuellen Quelle bauen
 build_backup_args() {
   BACKUP_PATHS=() EXCLUDE_ARGS=()
-  local p
-  for p in "${(@f)$(read_list "$INCLUDE_FILE")}"; do
+  local p root=${SRC_ROOT%/}
+  for p in "${(@f)$(read_list "$SRC_INCLUDE")}"; do
     [[ -z "$p" ]] && continue
-    if [[ -e "$SSD/$p" ]]; then BACKUP_PATHS+=("$SSD/$p")
-    else log "WARNUNG: Ordner aus include.txt fehlt auf der SSD: $p"; fi
+    if [[ -e "$root/$p" ]]; then BACKUP_PATHS+=("$root/$p")
+    else log "WARNUNG: Ordner aus include.txt fehlt in $SRC_NAME: $p"; fi
   done
   # Liste gefüllt, aber nichts davon existiert → lieber abbrechen
-  [[ -n "$(read_list "$INCLUDE_FILE")" ]] && (( ${#BACKUP_PATHS} == 0 )) && return 1
-  (( ${#BACKUP_PATHS} )) || BACKUP_PATHS=("$SSD")
+  [[ -n "$(read_list "$SRC_INCLUDE")" ]] && (( ${#BACKUP_PATHS} == 0 )) && return 1
+  (( ${#BACKUP_PATHS} )) || BACKUP_PATHS=("$SRC_ROOT")
 
   for p in "${SYSTEM_EXCLUDES[@]}"; do EXCLUDE_ARGS+=(--exclude "$p"); done
-  for p in "${(@f)$(read_list "$EXCLUDE_FILE")}"; do
+  [[ "$SRC_ROOT" == "/" ]] && for p in "${ROOT_EXCLUDES[@]}"; do EXCLUDE_ARGS+=(--exclude "$p"); done
+  for p in "${(@f)$(read_list "$SRC_EXCLUDE")}"; do
     [[ -z "$p" ]] && continue
     if [[ "$p" == *[\*\?\[]* ]]; then EXCLUDE_ARGS+=(--exclude "$p")
-    else EXCLUDE_ARGS+=(--exclude "$SSD/$p"); fi
+    else EXCLUDE_ARGS+=(--exclude "$root/$p"); fi
   done
   EXCLUDE_ARGS+=(--exclude-if-present .nobackup --exclude-caches)
 }
@@ -252,7 +415,7 @@ do_backup() {
   local -a f
   S[phase]=backup; S[percent]=0; S[eta]=0; save_status
   export RESTIC_PROGRESS_FPS=0.5   # alle 2 s ein Status
-  restic backup --json --tag ssd --group-by host,tags \
+  restic backup --json --tag "$SRC_TAG" --group-by host,tags \
       --host "$(scutil --get LocalHostName)" \
       "${EXCLUDE_ARGS[@]}" "${BACKUP_PATHS[@]}" 2>"$STATE_DIR/backup.err" |
   while IFS= read -r line; do
@@ -333,9 +496,14 @@ repair_repo() {
   S[phase]=repair; save_status
   repair_packs >> "$LOG_FILE" 2>&1 || return 1
   log "REPARATUR: fehlende Daten erneut hochladen"
-  do_backup; local rc=$?
-  [[ -d "$SSD" ]] || return 3
-  (( rc == 0 || rc == 3 )) || return 1
+  local id rc
+  for id in "${DONE_IDS[@]}"; do
+    load_source "$id" && src_present && build_backup_args || continue
+    S[source]=$SRC_ID S[source_name]=$SRC_NAME S[source_root]=$SRC_ROOT
+    do_backup; rc=$?
+    src_present || return 3
+    (( rc == 0 || rc == 3 )) || return 1
+  done
   verify_repo; local v=$?
   (( v == 0 )) || return 1
   log "REPARATUR erfolgreich"
@@ -361,30 +529,45 @@ locked_msg() {
 }
 
 cmd_run() {
-  local force=0; [[ "$1" == "--force" ]] && force=1
-  # von der App angefordert ("Backup jetzt starten")
-  [[ -f "$STATE_DIR/force_next" ]] && { force=1; rm -f "$STATE_DIR/force_next"; }
-
-  # launchd startet uns bei JEDEM eingehängten Laufwerk und stündlich → still beenden
-  [[ -d "$SSD" ]] || exit 0
-
-  # Direkt nach "schedule apply" startet launchd uns einmal – das ist kein echter Auslöser
-  if (( ! force )) && [[ -f "$STATE_DIR/schedule_applied" ]]; then
-    (( $(now) - $(cat "$STATE_DIR/schedule_applied") < 90 )) && exit 0
+  local force=0; local -a only=()
+  if [[ "$1" == "--force" ]]; then force=1; shift; only=("$@"); fi
+  # von der App angefordert ("Backup starten"), evtl. nur für bestimmte Quellen
+  if [[ -f "$STATE_DIR/force_next" ]]; then
+    force=1; only=("${(@f)$(<"$STATE_DIR/force_next")}"); only=(${only:#}); rm -f "$STATE_DIR/force_next"
   fi
 
-  # Automatik pausiert? (manueller Start geht trotzdem)
-  (( ! force )) && [[ -f "$STATE_DIR/paused" ]] && exit 0
+  if (( ! force )); then
+    # Direkt nach "schedule apply" startet launchd uns einmal – das ist kein echter Auslöser
+    [[ -f "$STATE_DIR/schedule_applied" ]] && (( $(now) - $(<"$STATE_DIR/schedule_applied") < 90 )) && exit 0
+    # Automatik pausiert? (manueller Start geht trotzdem)
+    [[ -f "$STATE_DIR/paused" ]] && exit 0
+  fi
 
-  # Mindestabstand – außer eine Reparatur steht noch aus. Steht nur eine
-  # (wegen Einhängen) übersprungene Prüfung aus, wird nur diese nachgeholt.
-  local check_only=0
-  if (( ! force )) && [[ -f "$STATE_DIR/last_success" && ! -f "$STATE_DIR/needs_repair" ]]; then
-    if (( ( $(now) - $(cat "$STATE_DIR/last_success") ) / 3600 < MIN_HOURS_BETWEEN )); then
-      [[ -f "$STATE_DIR/needs_check" ]] || exit 0
-      backup_is_mounted && exit 0      # immer noch eingehängt → später
-      check_only=1
+  # --- fällige Quellen bestimmen -------------------------------------------
+  # launchd startet uns bei JEDEM eingehängten Laufwerk und stündlich → meist still beenden
+  local -a due=(); local id
+  for id in $(source_ids); do
+    load_source "$id" || continue
+    if (( ${#only} )); then (( ${only[(Ie)$id]} )) || continue
+    else (( SRC_ENABLED )) || continue; fi
+    src_present || continue
+    # Mindestabstand je Quelle – außer eine Reparatur steht noch aus
+    if (( ! force )) && [[ ! -f "$STATE_DIR/needs_repair" && -f "$SRC_STATE/last_success" ]]; then
+      (( ( $(now) - $(<"$SRC_STATE/last_success") ) / 3600 < MIN_HOURS_BETWEEN )) && continue
     fi
+    due+=("$id")
+  done
+
+  # Nichts fällig: höchstens eine (wegen Einhängen) übersprungene Prüfung nachholen
+  local check_only=0
+  if (( ! ${#due} )); then
+    if (( force )); then
+      print "Keine der gewählten Quellen ist gerade verfügbar (nicht angesteckt oder deaktiviert)."
+      exit 1
+    fi
+    [[ -f "$STATE_DIR/needs_check" ]] || exit 0
+    backup_is_mounted && exit 0      # immer noch eingehängt → später
+    check_only=1
   fi
 
   # Nur ein Lauf gleichzeitig
@@ -404,17 +587,15 @@ cmd_run() {
   command -v rclone >/dev/null || fail "rclone nicht gefunden (brew install rclone)"
   command -v jq     >/dev/null || fail "jq nicht gefunden (brew install jq)"
 
-  (( force )) || sleep 15        # Laufwerk nach dem Einstecken kurz ankommen lassen
-  [[ -d "$SSD" ]] || exit 0
+  (( force || check_only )) || sleep 15        # Laufwerk nach dem Einstecken kurz ankommen lassen
 
   # Mac wach halten, solange dieser Lauf dauert
   caffeinate -i -w $$ &!
 
-  S=(state running phase connect started $(now) pid $$ percent 0)
+  local -a names=(); for id in $due; do load_source "$id"; names+=("$SRC_NAME"); done
+  S=(state running phase connect started $(now) pid $$ percent 0 sources_total ${#due} sources "${(j:, :)names}")
   save_status
-
-  build_backup_args || fail "Keiner der Ordner aus include.txt existiert auf der SSD"
-  log "=== Backup gestartet: ${(j:, :)BACKUP_PATHS} → $RESTIC_REPOSITORY"
+  (( check_only )) || log "=== Backup gestartet: ${(j:, :)names} → $RESTIC_REPOSITORY"
 
   local i
   for i in {1..5}; do
@@ -430,16 +611,18 @@ cmd_run() {
     verify_repo; local v=$?
     if (( v == 0 || v == 4 )); then
       (( v == 0 )) && rm -f "$STATE_DIR/needs_check"
-      # Anzeige wieder auf das letzte Backup setzen
+      # Anzeige wieder auf den letzten Lauf setzen
       S=(); [[ -f "$STATE_DIR/last_run" ]] && source "$STATE_DIR/last_run"
-      (( v == 0 )) && { S[state]=ok; S[message]=""; }
+      (( v == 0 )) && [[ ${S[state]} == warning ]] && { S[state]=ok; S[message]=""; }
       save_status
-      (( v == 0 )) && { cp "$STATUS_FILE" "$STATE_DIR/last_run"; cp "$STATUS_FILE.json" "$STATE_DIR/last_run.json"; }
+      (( v == 0 )) && dump_status "$STATE_DIR/last_run"
       log "=== Prüfung $( (( v == 0 )) && print ok || print 'weiterhin gesperrt' )"
       exit 0
     fi
-    # Probleme gefunden → normaler Lauf mit Reparatur
+    # Probleme gefunden → Reparatur mit allen verfügbaren Quellen
     rm -f "$STATE_DIR/needs_check"; touch "$STATE_DIR/needs_repair"
+    for id in $(source_ids); do load_source "$id" && (( SRC_ENABLED )) && src_present && due+=("$id"); done
+    (( ${#due} )) || fail "Backup auf pCloud beschädigt – Reparatur, sobald eine Quelle verfügbar ist"
   fi
 
   # --- ausstehende Reparatur aus einem früheren Lauf zuerst erledigen -----
@@ -451,7 +634,7 @@ cmd_run() {
       S[phase]=repair; save_status
       repair_packs >> "$LOG_FILE" 2>&1 \
         || fail "Reparatur (repair packs) fehlgeschlagen"
-      log "Beschädigte Pakete entfernt – das folgende Backup lädt die Daten neu hoch"
+      log "Beschädigte Pakete entfernt – die folgenden Backups laden die Daten neu hoch"
     elif (( v == 4 )); then
       # Backup selbst geht auch bei eingehängtem Backup – Reparatur später
       log "WARNUNG: $(locked_msg) Normales Backup läuft trotzdem."
@@ -460,36 +643,59 @@ cmd_run() {
     fi
   fi
 
-  notify "Läuft" "Backup von $SSD_NAME nach pCloud gestartet"
+  # --- Backup jeder fälligen Quelle ------------------------------------------
+  local overall=ok rc n=0 k
+  local -a msgs=(); typeset -ga DONE_IDS=()
+  for id in $due; do
+    (( n++ )); load_source "$id"
+    for k in total_files files_done total_bytes bytes_done eta current elapsed files_new files_changed data_added snapshot; do
+      unset "S[$k]"
+    done
+    S[source]=$SRC_ID S[source_name]=$SRC_NAME S[source_root]=$SRC_ROOT S[source_index]=$n S[state]=running
+    save_status
+    if ! src_present; then
+      source_result warning "Nicht mehr verfügbar – wird beim nächsten Mal gesichert" 0
+      continue
+    fi
+    if ! build_backup_args; then
+      source_result error "Keiner der Ordner aus der Liste existiert"
+      continue
+    fi
+    log "--- $SRC_NAME ($n/${#due}): ${(j:, :)BACKUP_PATHS}"
+    notify "Läuft" "Backup von $SRC_NAME nach pCloud gestartet"
 
-  # --- Backup --------------------------------------------------------------
-  do_backup; local rc=$?
+    do_backup; rc=$?
 
-  # SSD während des Backups abgezogen? Dann ist der Stand unvollständig.
-  [[ -d "$SSD" ]] || fail "SSD wurde während des Backups entfernt – wird beim nächsten Einstecken fortgesetzt"
+    # Platte während des Backups abgezogen? Dann ist der Stand unvollständig.
+    if ! src_present; then
+      source_result warning "Während des Backups entfernt – wird beim nächsten Einstecken fortgesetzt" 0
+    elif (( rc == 3 )); then
+      log "WARNUNG ($SRC_NAME): einige Dateien konnten nicht gelesen werden (siehe oben)"
+      source_result warning "Einige Dateien wurden übersprungen"
+    elif (( rc != 0 )); then
+      source_result error "restic backup beendet mit Code $rc"
+    else
+      source_result ok ""
+    fi
+  done
+  S[source]="" S[source_name]="" S[source_index]=""
 
-  if (( rc == 3 )); then
-    log "WARNUNG: einige Dateien konnten nicht gelesen werden (siehe oben)"
-    S[state]=warning S[message]="Einige Dateien wurden übersprungen"
-  elif (( rc != 0 )); then
-    fail "restic backup beendet mit Code $rc"
-  else
-    S[state]=ok S[message]=""
-  fi
-  local final_state=${S[state]} final_msg=${S[message]}
+  (( ${#DONE_IDS} )) || fail "${(j:; :)msgs}"
+  local final_state=$overall final_msg="${(j:; :)msgs}"
 
   # --- Schnellprüfung, bei Bedarf automatisch reparieren --------------------
   verify_repo; local v=$?
   if (( v == 1 )); then
     touch "$STATE_DIR/needs_repair"
     repair_repo; local r=$?
-    (( r == 3 )) && fail "SSD wurde während der Reparatur entfernt – wird beim nächsten Einstecken fortgesetzt"
+    (( r == 3 )) && fail "Quelle wurde während der Reparatur entfernt – wird beim nächsten Mal fortgesetzt"
     (( r != 0 )) && fail "Backup auf pCloud beschädigt, Reparatur fehlgeschlagen – nächster Versuch in 1 Std."
   elif (( v == 4 )); then
     # Backup selbst ist durch – nur die Prüfung holen wir nach dem Aushängen nach
     touch "$STATE_DIR/needs_check"
     log "WARNUNG: $(locked_msg)"
-    final_state=warning final_msg="Gesichert, aber Prüfung/Reparatur übersprungen: $(locked_msg)"
+    final_state=$(worse $final_state warning)
+    final_msg="${final_msg:+$final_msg; }Prüfung übersprungen: $(locked_msg)"
   elif (( v == 2 )); then
     touch "$STATE_DIR/needs_repair"
     fail "Prüfung meldet Fehler, die nicht automatisch reparierbar sind – siehe Log"
@@ -497,8 +703,8 @@ cmd_run() {
   (( v == 4 )) || rm -f "$STATE_DIR/needs_repair" "$STATE_DIR/needs_check"
   date +%s > "$STATE_DIR/last_success"
 
-  # --- Aufräumen ---------------------------------------------------------
-  local -a forget_args=(--tag ssd --group-by host,tags
+  # --- Aufräumen (gilt für alle Quellen, je Stichwort getrennt) -----------
+  local -a forget_args=(--group-by host,tags
       --keep-daily $KEEP_DAILY --keep-weekly $KEEP_WEEKLY
       --keep-monthly $KEEP_MONTHLY --keep-yearly $KEEP_YEARLY)
   S[state]=running; S[phase]=cleanup; save_status
@@ -524,14 +730,31 @@ cmd_run() {
     fi
   fi
 
-  S[state]=$final_state; S[message]=$final_msg; S[phase]=done; S[finished]=$(now); save_status
-  cp "$STATUS_FILE" "$STATE_DIR/last_run"
-  cp "$STATUS_FILE.json" "$STATE_DIR/last_run.json" 2>/dev/null
+  S[state]=$final_state; S[message]=$final_msg; S[phase]=done; S[finished]=$(now); S[percent]=100
+  save_status
+  dump_status "$STATE_DIR/last_run"
   log "=== Backup beendet ($final_state)"
   if [[ $final_state == ok ]]; then
-    notify "Erfolgreich" "$(hbytes ${S[data_added]}) neu hochgeladen – Dauer $(hdur $(( S[finished] - S[started] )))"
+    notify "Erfolgreich" "${S[sources]} gesichert – Dauer $(hdur $(( S[finished] - S[started] )))"
   else
     notify "Mit Warnungen fertig" "${S[message]} – siehe: ssd-backup log"
+  fi
+}
+
+# Ergebnis der aktuellen Quelle festhalten (je Quelle + Gesamtzustand)
+source_result() {   # source_result ok|warning|error MELDUNG [ERFOLG=1]
+  local st=$1 msg=$2 success=${3:-1}
+  [[ $st == error ]] && success=0
+  [[ $st == error ]] && log "FEHLER ($SRC_NAME): $msg"
+  overall=$(worse $overall $st)
+  [[ -n "$msg" ]] && msgs+=("$SRC_NAME: $msg")
+  local -A keep; keep=("${(@kv)S}")
+  S[state]=$st S[message]=$msg S[finished]=$(now) S[phase]=done
+  dump_status "$SRC_STATE/last_run"
+  S=("${(@kv)keep}")
+  if (( success )); then
+    date +%s > "$SRC_STATE/last_success"
+    DONE_IDS+=("$SRC_ID")
   fi
 }
 
@@ -550,12 +773,12 @@ bar() {
 print_status() {
   load_status
   local B=$'\e[1m' D=$'\e[2m' R=$'\e[0m' G=$'\e[32m' Y=$'\e[33m' E=$'\e[31m' C=$'\e[36m'
-  print "${B}SSD-Backup${R}  ${D}$SSD_NAME → pCloud:$REPO_PATH${R}\n"
+  print "${B}SSD-Backup${R}  ${D}→ pCloud:$REPO_PATH${R}\n"
 
   local state=${S[state]:-none}
   # läuft laut Datei, aber Prozess ist weg → abgebrochen
   if [[ $state == running ]] && ! kill -0 ${S[pid]:-0} 2>/dev/null; then
-    state=error; S[message]="Abgebrochen (Mac ausgeschaltet/SSD entfernt?)"
+    state=error; S[message]="Abgebrochen (Mac ausgeschaltet/Platte entfernt?)"
   fi
 
   case $state in
@@ -571,46 +794,52 @@ print_status() {
         *)       phase=${S[phase]} ;;
       esac
       print "  Zustand      ${C}● läuft${R} – $phase  ${D}(seit $(hdur $(( $(now) - S[started] ))))${R}"
-      if [[ -n ${S[total_bytes]} ]]; then
+      [[ -n ${S[source_name]} ]] && print "  Quelle       ${B}${S[source_name]}${R}  ${D}(${S[source_index]} von ${S[sources_total]})${R}"
+      if [[ ${S[phase]} == backup && -n ${S[total_bytes]} ]]; then
         print "  Fortschritt  ${C}$(bar ${S[percent]})${R}  ${B}${S[percent]} %${R}"
         print "  Daten        $(hbytes ${S[bytes_done]}) von $(hbytes ${S[total_bytes]})"
         print "  Dateien      $(hnum ${S[files_done]}) von $(hnum ${S[total_files]})"
         (( ${S[eta]:-0} > 0 )) && print "  Restzeit     ca. $(hdur ${S[eta]})"
         if [[ -n ${S[current]} ]]; then
-          local cur=${S[current]#$SSD/}
+          local cur=${S[current]#${S[source_root]%/}/}
           (( ${#cur} > 60 )) && cur="…${cur: -59}"
           print "  Aktuell      ${D}$cur${R}"
         fi
         (( ${S[elapsed]:-0} < 300 && ${S[percent]%.*} < 5 )) && \
           print "  ${D}(Am Anfang zählt restic noch Dateien – die Prozentzahl wird genauer.)${R}"
       fi ;;
-    ok)      print "  Zustand      ${G}✓ letztes Backup erfolgreich${R}" ;;
+    ok)      print "  Zustand      ${G}✓ letzter Lauf erfolgreich${R}" ;;
     warning) print "  Zustand      ${Y}⚠ fertig mit Warnungen${R} – ${S[message]}" ;;
     error)   print "  Zustand      ${E}✗ Fehler${R} – ${S[message]}" ;;
     *)       print "  Zustand      ${D}noch kein Backup gelaufen${R}" ;;
   esac
 
-  print ""
-  if [[ -f "$STATE_DIR/last_success" ]]; then
-    local ts=$(cat "$STATE_DIR/last_success")
-    print "  Letztes erfolgreiches Backup   $(date -r $ts '+%d.%m.%Y %H:%M')  ${D}(vor $(hdur $(( $(now) - ts ))))${R}"
-    if [[ -f "$STATE_DIR/last_run" ]]; then
-      local -A L; L=("${(@kv)S}"); source "$STATE_DIR/last_run"
-      print "  Dabei neu hochgeladen          $(hbytes ${S[data_added]})  ${D}($(hnum ${S[files_new]}) neue, $(hnum ${S[files_changed]}) geänderte Dateien, gesamt $(hbytes ${S[total_bytes]}))${R}"
+  print "\n  ${B}Quellen${R}"
+  local id dot avail inc exc scope last warn ts; local -a ids; ids=($(source_ids))
+  local -A L
+  (( ${#ids} )) || print "  ${D}keine – hinzufügen mit: ssd-backup source add${R}"
+  for id in $ids; do
+    load_source "$id"
+    if src_present; then dot="${G}●${R}"; src_external && avail="angesteckt" || avail="intern"
+    else dot="${D}○${R}"; src_external && avail="nicht angesteckt" || avail="nicht gefunden"; fi
+    (( SRC_ENABLED )) || avail="$avail, deaktiviert"
+    inc=$(read_list "$SRC_INCLUDE" | wc -l | tr -d ' ')
+    exc=$(read_list "$SRC_EXCLUDE" | wc -l | tr -d ' ')
+    (( inc )) && scope="$inc Ordner" || scope="alles"; (( exc )) && scope+=", $exc Ausschlüsse"
+    last="${D}noch nie gesichert${R}" warn=""
+    if [[ -f "$SRC_STATE/last_success" ]]; then
+      ts=$(<"$SRC_STATE/last_success")
+      last="zuletzt $(date -r $ts '+%d.%m.%Y %H:%M') ${D}(vor $(hdur $(( $(now) - ts ))))${R}"
+      (( ( $(now) - ts ) / 86400 >= 7 )) && warn="  ${Y}⚠ über 7 Tage alt${R}"
+    fi
+    print "  $dot ${B}$SRC_NAME${R}  ${D}$SRC_ROOT · $avail · $scope${R}"
+    print "      $last$warn"
+    if [[ -f "$SRC_STATE/last_run" ]]; then
+      L=("${(@kv)S}"); source "$SRC_STATE/last_run"
+      [[ ${S[state]} == (warning|error) && -n ${S[message]} ]] && print "      ${Y}${S[message]}${R}"
       S=("${(@kv)L}")
     fi
-    local age_d=$(( ( $(now) - ts ) / 86400 ))
-    (( age_d >= 7 )) && print "  ${Y}⚠ Das letzte Backup ist $age_d Tage alt – SSD mal wieder anstecken!${R}"
-  else
-    print "  Letztes erfolgreiches Backup   ${D}—${R}"
-  fi
-  [[ -d "$SSD" ]] && print "  SSD                            ${G}angesteckt${R}" \
-                  || print "  SSD                            ${D}nicht angesteckt${R}"
-
-  local inc; inc=$(read_list "$INCLUDE_FILE" | wc -l | tr -d ' ')
-  local exc; exc=$(read_list "$EXCLUDE_FILE" | wc -l | tr -d ' ')
-  (( inc )) && print "  Umfang                         $inc Ordner, $exc Ausschlüsse" \
-            || print "  Umfang                         ganze SSD, $exc Ausschlüsse"
+  done
 }
 
 cmd_status() {
@@ -710,17 +939,24 @@ PLIST
 # ---------------------------------------------------------------------------
 cmd_help() {
   cat <<'EOF'
-ssd-backup – verschlüsseltes SSD-Backup nach pCloud
+ssd-backup – verschlüsseltes Backup von Platten/Ordnern nach pCloud
 
   ssd-backup status            aktuellen Stand anzeigen
   ssd-backup status -w         live mitverfolgen (Ctrl-C beendet)
-  ssd-backup run --force       Backup sofort starten (in diesem Terminal)
-  ssd-backup start             Backup sofort im Hintergrund starten
+  ssd-backup run --force [ID …]  Backup sofort starten (in diesem Terminal)
+  ssd-backup start [ID …]      Backup sofort im Hintergrund starten (ohne ID: alle verfügbaren)
   ssd-backup stop              laufendes Backup abbrechen
   ssd-backup pause | resume    Automatik pausieren / wieder aktivieren
   ssd-backup browse            Backup im Finder einhängen (~/restic-mount)
 
-  ssd-backup include add [ORDNER …]   Ordner sichern (ohne Angabe: Finder-Dialog)
+  ssd-backup sources           alle Quellen (Platten/Ordner) anzeigen
+  ssd-backup source add [PFAD] [NAME]   Platte oder Ordner hinzufügen (ohne Pfad: Finder-Dialog)
+  ssd-backup source remove ID           Quelle entfernen (Stände in pCloud bleiben)
+  ssd-backup source enable|disable ID   Quelle (de)aktivieren
+  ssd-backup source rename ID NAME
+
+  Ordnerlisten gelten je Quelle – mit -s ID wählen (sonst die erste):
+  ssd-backup include [-s ID] add [ORDNER …]   Ordner sichern (ohne Angabe: Finder-Dialog)
   ssd-backup include remove [ORDNER]  aus der Liste nehmen (ohne Angabe: Auswahl)
   ssd-backup exclude add [ORDNER|MUSTER …]   Ordner/Muster ausschließen
   ssd-backup exclude remove [ORDNER]
@@ -734,7 +970,7 @@ ssd-backup – verschlüsseltes SSD-Backup nach pCloud
   ssd-backup restic …          beliebiger restic-Befehl mit dem Backup,
                                z. B.: ssd-backup restic restore latest --target ~/Desktop/restore --include "/Volumes/…/Fotos"
 
-Ist include leer, wird die ganze SSD gesichert. Eine Datei ".nobackup"
+Ist include leer, wird die ganze Quelle gesichert. Eine Datei ".nobackup"
 in einem Ordner schließt diesen Ordner ebenfalls aus.
 EOF
 }
@@ -746,13 +982,15 @@ case $cmd in
   status|st)          cmd_status "$@" ;;
   include|inc)        manage_list include "$@" ;;
   exclude|exc)        manage_list exclude "$@" ;;
-  lists|ls)           manage_list include list; print; manage_list exclude list ;;
-  edit)               open -t "$SETTINGS" "$INCLUDE_FILE" "$EXCLUDE_FILE" ;;
-  snapshots|snap)     restic snapshots --tag ssd ;;
+  lists)              for _id in $(source_ids); do manage_list include -s "$_id" list; manage_list exclude -s "$_id" list; print; done ;;
+  sources)            cmd_source list ;;
+  source|src)         cmd_source "$@" ;;
+  edit)               open -t "$SETTINGS" "$SOURCES_DIR"/*/source.conf(N) "$SOURCES_DIR"/*/include.txt(N) "$SOURCES_DIR"/*/exclude.txt(N) ;;
+  snapshots|snap)     restic snapshots ;;
   log)                tail -n 40 -f "$LOG_FILE" ;;
   restic)             restic "$@" ;;
   start)              # Backup über launchd starten (läuft unabhängig vom Terminal/der App)
-                      touch "$STATE_DIR/force_next"
+                      print -rl -- "$@" > "$STATE_DIR/force_next"
                       launchctl kickstart "gui/$(id -u)/com.user.ssd-backup" ;;
   stop)               pid=$(cat "$LOCK_DIR/pid" 2>/dev/null)
                       if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then

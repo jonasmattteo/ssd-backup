@@ -11,12 +11,12 @@ enum Paths {
     static let cli = home + "/bin/ssd-backup"
     static let confDir = home + "/.config/ssd-backup"
     static let settings = confDir + "/settings.conf"
-    static let include = confDir + "/include.txt"
-    static let exclude = confDir + "/exclude.txt"
+    static let sourcesDir = confDir + "/sources"
     static let stateDir = home + "/Library/Application Support/ssd-backup"
     static let statusJSON = stateDir + "/status.json"
     static let lastRunJSON = stateDir + "/last_run.json"
     static let lastSuccess = stateDir + "/last_success"
+    static let sourcesState = stateDir + "/sources"
     static let paused = stateDir + "/paused"
     static let needsRepair = stateDir + "/needs_repair"
     static let log = home + "/Library/Logs/ssd-backup.log"
@@ -99,6 +99,70 @@ struct ListFile {
     }
 }
 
+// MARK: - Quellen (Platten/Ordner)
+
+struct BackupSource: Identifiable, Equatable {
+    let id: String
+    var name: String
+    var root: String
+    var enabled: Bool
+    var connected: Bool
+    var includes: [String]
+    var excludes: [String]
+    var lastSuccess: Date?
+    var lastRun: [String: String]
+
+    var external: Bool { root.hasPrefix("/Volumes/") }
+    var includeFile: String { Paths.sourcesDir + "/\(id)/include.txt" }
+    var excludeFile: String { Paths.sourcesDir + "/\(id)/exclude.txt" }
+    var icon: String { external ? symbol("externaldrive.fill") : symbol("internaldrive.fill", fallback: "folder.fill") }
+    var availability: String {
+        connected ? (external ? "angesteckt" : "intern") : (external ? "nicht angesteckt" : "nicht gefunden")
+    }
+    var scopeText: String {
+        (includes.isEmpty ? "alles" : "\(includes.count) Ordner") + (excludes.isEmpty ? "" : ", \(excludes.count) Ausschlüsse")
+    }
+    var isOld: Bool { lastSuccess.map { Date().timeIntervalSince($0) > 7 * 86400 } ?? false }
+
+    /// Wert aus source.conf lesen ("…" mit \-Escapes, wie vom Skript geschrieben)
+    static func value(_ text: String, _ key: String) -> String? {
+        for line in text.split(separator: "\n") where line.hasPrefix(key + "=") {
+            var v = Substring(line.dropFirst(key.count + 1))
+            guard v.first == "\"" else { return String(v).trimmingCharacters(in: .whitespaces) }
+            v = v.dropFirst()
+            var out = "", esc = false
+            for c in v {
+                if esc { out.append(c); esc = false }
+                else if c == "\\" { esc = true }
+                else if c == "\"" { break }
+                else { out.append(c) }
+            }
+            return out
+        }
+        return nil
+    }
+
+    static func loadAll() -> [BackupSource] {
+        let fm = FileManager.default
+        let ids = ((try? fm.contentsOfDirectory(atPath: Paths.sourcesDir)) ?? []).sorted()
+        return ids.compactMap { id in
+            guard let text = try? String(contentsOfFile: Paths.sourcesDir + "/\(id)/source.conf", encoding: .utf8) else { return nil }
+            let root = value(text, "ROOT") ?? ""
+            var isDir: ObjCBool = false
+            let connected = !root.isEmpty && fm.fileExists(atPath: root, isDirectory: &isDir) && isDir.boolValue
+            let state = Paths.sourcesState + "/\(id)"
+            var last: Date?
+            if let t = try? String(contentsOfFile: state + "/last_success", encoding: .utf8),
+               let ts = Double(t.trimmingCharacters(in: .whitespacesAndNewlines)) { last = Date(timeIntervalSince1970: ts) }
+            return BackupSource(id: id, name: value(text, "NAME") ?? id, root: root,
+                                enabled: (value(text, "ENABLED") ?? "1") != "0", connected: connected,
+                                includes: ListFile(path: Paths.sourcesDir + "/\(id)/include.txt").entries(),
+                                excludes: ListFile(path: Paths.sourcesDir + "/\(id)/exclude.txt").entries(),
+                                lastSuccess: last, lastRun: readJSON(state + "/last_run.json"))
+        }
+    }
+}
+
 // MARK: - Einstellungen (settings.conf)
 
 struct SettingsDraft: Equatable {
@@ -175,15 +239,13 @@ final class BackupModel: ObservableObject {
     @Published var status: [String: String] = [:]
     @Published var lastRun: [String: String] = [:]
     @Published var lastSuccess: Date?
-    @Published var ssdName = "SSD"
     @Published var repoPath = ""
-    @Published var ssdConnected = false
+    @Published var sources: [BackupSource] = []
+    @Published var selectedSourceID: String?
     @Published var paused = false
     @Published var repairPending = false
     @Published var mounted = false
     @Published var mounting = false
-    @Published var includes: [String] = []
-    @Published var excludes: [String] = []
     @Published var autostart = false
     @Published var cliMissing = false
     @Published var message: String?
@@ -200,7 +262,8 @@ final class BackupModel: ObservableObject {
     private var timer: Timer?
     private var mountProcess: Process?
 
-    var ssdPath: String { "/Volumes/" + ssdName }
+    var selectedSource: BackupSource? { sources.first { $0.id == selectedSourceID } ?? sources.first }
+    var anyAvailable: Bool { sources.contains { $0.enabled && $0.connected } }
 
     init() {
         refresh()
@@ -269,7 +332,6 @@ final class BackupModel: ObservableObject {
                 if let v = Self.settingValue(line, key: key) { d[key] = v }
             }
             if d != settings { settings = d }
-            if let v = d["SSD_NAME"] { ssdName = v }
             if let v = d["REPO_PATH"] { repoPath = v }
         }
         status = readJSON(Paths.statusJSON)
@@ -278,14 +340,15 @@ final class BackupModel: ObservableObject {
            let ts = Double(t.trimmingCharacters(in: .whitespacesAndNewlines)) {
             lastSuccess = Date(timeIntervalSince1970: ts)
         } else { lastSuccess = nil }
-        var isDir: ObjCBool = false
-        ssdConnected = fm.fileExists(atPath: ssdPath, isDirectory: &isDir) && isDir.boolValue
+        let all = BackupSource.loadAll()
+        if all != sources { sources = all }
+        if selectedSourceID == nil || !sources.contains(where: { $0.id == selectedSourceID }) {
+            selectedSourceID = sources.first?.id
+        }
         paused = fm.fileExists(atPath: Paths.paused)
         repairPending = fm.fileExists(atPath: Paths.needsRepair)
         mounted = fm.fileExists(atPath: Paths.mountPoint + "/snapshots")
         if mounted { mounting = false }
-        includes = ListFile(path: Paths.include).entries()
-        excludes = ListFile(path: Paths.exclude).entries()
         autostart = fm.fileExists(atPath: Paths.appAgent)
     }
 
@@ -303,11 +366,17 @@ final class BackupModel: ObservableObject {
 
     // MARK: Aktionen
 
-    func startBackup() {
-        guard ssdConnected else { message = "Die SSD „\(ssdName)“ ist nicht angesteckt."; return }
+    /// Backup aller verfügbaren Quellen – oder nur einer bestimmten
+    func startBackup(_ source: BackupSource? = nil) {
+        if let s = source {
+            guard s.connected else { message = "„\(s.name)“ ist \(s.availability)."; return }
+        } else {
+            guard anyAvailable else { message = "Keine Quelle verfügbar – Platte anstecken oder Quelle aktivieren."; return }
+        }
         if mounted { message = "Hinweis: Während das Backup eingehängt ist, kann eine Reparatur nicht laufen." }
+        let args = ["start"] + (source.map { [$0.id] } ?? [])
         DispatchQueue.global().async {
-            let r = runCLI(["start"])
+            let r = runCLI(args)
             Task { @MainActor in
                 if r.status != 0 { self.message = "Start fehlgeschlagen: \(r.output)" }
                 self.refresh()
@@ -440,43 +509,86 @@ final class BackupModel: ObservableObject {
 
     // MARK: Ordnerlisten
 
-    /// Absoluten Pfad in einen Pfad relativ zur SSD umwandeln
-    func relative(_ url: URL) -> String? {
-        let root = URL(fileURLWithPath: ssdPath).resolvingSymlinksInPath().standardizedFileURL.path
+    /// Absoluten Pfad in einen Pfad relativ zur Quelle umwandeln
+    func relative(_ url: URL, to source: BackupSource) -> String? {
+        var root = URL(fileURLWithPath: source.root).resolvingSymlinksInPath().standardizedFileURL.path
+        if root == "/" { root = "" }
         let p = url.resolvingSymlinksInPath().standardizedFileURL.path
         guard p.hasPrefix(root + "/") else { return nil }
         return String(p.dropFirst(root.count + 1))
     }
 
-    func pickFolders() -> [String] {
-        guard ssdConnected else { message = "Die SSD „\(ssdName)“ ist nicht angesteckt."; return [] }
+    func pickFolders(in source: BackupSource) -> [String] {
+        guard source.connected else { message = "„\(source.name)“ ist \(source.availability)."; return [] }
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = true
-        panel.directoryURL = URL(fileURLWithPath: ssdPath)
+        panel.directoryURL = URL(fileURLWithPath: source.root)
         panel.prompt = "Auswählen"
-        panel.message = "Ordner auf „\(ssdName)“ wählen (Mehrfachauswahl mit ⌘)"
+        panel.message = "Ordner in „\(source.name)“ wählen (Mehrfachauswahl mit ⌘)"
         NSApp.activate(ignoringOtherApps: true)
         guard panel.runModal() == .OK else { return [] }
         var out: [String] = []
         for u in panel.urls {
-            if let r = relative(u) { out.append(r) } else { message = "„\(u.path)“ liegt nicht auf der SSD." }
+            if let r = relative(u, to: source) { out.append(r) } else { message = "„\(u.path)“ liegt nicht in „\(source.name)“." }
         }
         return out
     }
 
-    func add(_ items: [String], include: Bool) {
-        let file = ListFile(path: include ? Paths.include : Paths.exclude)
+    func add(_ items: [String], include: Bool, source: BackupSource) {
+        let file = ListFile(path: include ? source.includeFile : source.excludeFile)
         var list = file.entries()
         for i in items where !i.isEmpty && !list.contains(i) { list.append(i) }
         file.save(list)
         refresh()
     }
 
-    func remove(_ items: Set<String>, include: Bool) {
-        let file = ListFile(path: include ? Paths.include : Paths.exclude)
+    func remove(_ items: Set<String>, include: Bool, source: BackupSource) {
+        let file = ListFile(path: include ? source.includeFile : source.excludeFile)
         file.save(file.entries().filter { !items.contains($0) })
+        refresh()
+    }
+
+    // MARK: Quellen verwalten
+
+    func addSource() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = URL(fileURLWithPath: "/Volumes")
+        panel.prompt = "Hinzufügen"
+        panel.message = "Platte oder Ordner wählen, der gesichert werden soll (externe Platten liegen unter /Volumes)"
+        NSApp.activate(ignoringOtherApps: true)
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        let before = Set(sources.map(\.id))
+        let r = runCLI(["source", "add", url.path])
+        refresh()
+        if r.status != 0 { message = r.output.trimmingCharacters(in: .whitespacesAndNewlines); return }
+        if let new = sources.first(where: { !before.contains($0.id) }) {
+            selectedSourceID = new.id
+            selInclude = []; selExclude = []
+            if !new.external {
+                message = "„\(new.name)“ hinzugefügt. Für interne Ordner braucht /bin/zsh evtl. Festplattenvollzugriff (Systemeinstellungen → Datenschutz & Sicherheit)."
+            }
+        }
+    }
+
+    func removeSource(_ source: BackupSource) {
+        let alert = NSAlert()
+        alert.messageText = "„\(source.name)“ entfernen?"
+        alert.informativeText = "Die Quelle wird künftig nicht mehr gesichert. Bereits gesicherte Stände bleiben in pCloud erhalten und lassen sich weiter durchstöbern."
+        alert.addButton(withTitle: "Entfernen")
+        alert.addButton(withTitle: "Abbrechen")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        runCLI(["source", "remove", source.id])
+        refresh()
+    }
+
+    func setEnabled(_ source: BackupSource, _ on: Bool) {
+        runCLI(["source", on ? "enable" : "disable", source.id])
         refresh()
     }
 }
@@ -494,11 +606,9 @@ struct StatusView: View {
                 Image(systemName: "externaldrive.fill").foregroundStyle(.secondary)
                 VStack(alignment: .leading, spacing: 0) {
                     Text("SSD-Backup").font(.headline)
-                    Text("\(m.ssdName) → pCloud/\(m.repoPath)").font(.caption).foregroundStyle(.secondary)
+                    Text("\(m.sources.count) \(m.sources.count == 1 ? "Quelle" : "Quellen") → pCloud/\(m.repoPath)").font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer()
-                Circle().fill(m.ssdConnected ? Color.green : Color.secondary.opacity(0.4)).frame(width: 8, height: 8)
-                Text(m.ssdConnected ? "angesteckt" : "nicht angesteckt").font(.caption).foregroundStyle(.secondary)
             }
 
             if m.cliMissing {
@@ -529,7 +639,8 @@ struct StatusView: View {
                         Label("Backup starten", systemImage: "play.fill").frame(maxWidth: .infinity)
                     }
                     .keyboardShortcut(.defaultAction)
-                    .disabled(!m.ssdConnected)
+                    .disabled(!m.anyAvailable)
+                    .help("Alle angesteckten/verfügbaren Quellen jetzt sichern")
                 }
                 if m.mounted {
                     Button { m.openSnapshots() } label: {
@@ -558,7 +669,7 @@ struct StatusView: View {
             // Nebenaktionen
             HStack(spacing: 14) {
                 Button { openWindow(id: "folders"); NSApp.activate(ignoringOtherApps: true) } label: {
-                    Label("Ordner …", systemImage: "folder.badge.gearshape")
+                    Label("Quellen & Ordner …", systemImage: "folder.badge.gearshape")
                 }
                 Button { m.openLog() } label: { Label("Protokoll", systemImage: "doc.text.magnifyingglass") }
                 Spacer()
@@ -578,12 +689,52 @@ struct StatusView: View {
         .frame(width: 360)
     }
 
+    @ViewBuilder func sourceRow(_ src: BackupSource) -> some View {
+        let running = m.isRunning && m.status["source"] == src.id
+        HStack(spacing: 8) {
+            Image(systemName: src.icon).foregroundStyle(src.connected ? Color.accentColor : .secondary).frame(width: 18)
+            VStack(alignment: .leading, spacing: 1) {
+                HStack(spacing: 4) {
+                    Text(src.name).font(.callout.weight(.medium)).lineLimit(1)
+                    if !src.enabled { Text("deaktiviert").font(.caption2).foregroundStyle(.secondary) }
+                }
+                Group {
+                    if running { Text("wird gerade gesichert …") }
+                    else if let d = src.lastSuccess {
+                        Text("\(src.availability) · vor \(fmtDuration(Date().timeIntervalSince(d)))")
+                            .foregroundStyle(src.isOld ? .orange : .secondary)
+                    } else { Text("\(src.availability) · noch nie gesichert") }
+                }
+                .font(.caption).foregroundStyle(.secondary)
+                if !running, ["warning", "error"].contains(src.lastRun["state"] ?? ""), let msg = src.lastRun["message"], !msg.isEmpty {
+                    Text(msg).font(.caption2).foregroundStyle(.orange).lineLimit(2)
+                }
+            }
+            Spacer()
+            switch src.lastRun["state"] {
+            case "ok": Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+            case "warning": Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+            case "error": Image(systemName: "xmark.octagon.fill").foregroundStyle(.red)
+            default: EmptyView()
+            }
+            Button { m.startBackup(src) } label: { Image(systemName: "play.circle") }
+                .buttonStyle(.borderless)
+                .disabled(!src.connected || m.isRunning)
+                .help("Nur „\(src.name)“ jetzt sichern")
+        }
+        .opacity(src.enabled ? 1 : 0.6)
+    }
+
     @ViewBuilder var stateCard: some View {
         VStack(alignment: .leading, spacing: 8) {
             switch m.state {
             case .running:
                 Label { Text("Läuft – \(m.phaseText)") } icon: { ProgressView().controlSize(.small) }
                     .font(.callout.weight(.medium))
+                if let name = m.status["source_name"], !name.isEmpty {
+                    Text("Quelle: **\(name)**" + ((Int(m.status["sources_total"] ?? "") ?? 0) > 1 ? "  (\(m.status["source_index"] ?? "?") von \(m.status["sources_total"] ?? "?"))" : ""))
+                        .font(.caption)
+                }
                 if m.status["phase"] == "backup" || m.status["phase"] == "repair" {
                     ProgressView(value: m.percent) {
                         HStack {
@@ -605,7 +756,7 @@ struct StatusView: View {
                         }
                     }.font(.caption).monospacedDigit()
                     if let cur = m.status["current"], !cur.isEmpty {
-                        Text(cur.replacingOccurrences(of: m.ssdPath + "/", with: ""))
+                        Text(cur.replacingOccurrences(of: (m.status["source_root"] ?? "") + "/", with: ""))
                             .font(.caption2).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
                     }
                 }
@@ -633,28 +784,20 @@ struct StatusView: View {
 
             Divider()
 
-            Grid(alignment: .leading, horizontalSpacing: 10, verticalSpacing: 3) {
-                GridRow {
-                    Text("Letztes Backup").foregroundStyle(.secondary)
-                    if let d = m.lastSuccess {
-                        Text("\(d.formatted(date: .abbreviated, time: .shortened)) (vor \(fmtDuration(Date().timeIntervalSince(d))))")
-                    } else { Text("—") }
+            // Quellen
+            VStack(alignment: .leading, spacing: 6) {
+                if m.sources.isEmpty {
+                    Text("Noch keine Quelle – unter „Quellen & Ordner …“ hinzufügen.").font(.caption).foregroundStyle(.secondary)
                 }
-                if let added = m.lastRun["data_added"] {
-                    GridRow { Text("Hochgeladen").foregroundStyle(.secondary)
-                        Text("\(fmtBytes(added)) neu, gesamt \(fmtBytes(m.lastRun["total_bytes"]))") }
-                }
-                GridRow { Text("Umfang").foregroundStyle(.secondary)
-                    Text((m.includes.isEmpty ? "ganze SSD" : "\(m.includes.count) Ordner") + (m.excludes.isEmpty ? "" : ", \(m.excludes.count) Ausschlüsse")) }
-                GridRow { Text("Automatik").foregroundStyle(.secondary)
-                    Text(m.paused ? "pausiert" : m.savedSettings.scheduleText)
-                        .foregroundStyle(m.paused ? .orange : .primary) }
-            }.font(.caption)
-
-            if let d = m.lastSuccess, Date().timeIntervalSince(d) > 7 * 86400 {
-                Label("Das letzte Backup ist über eine Woche alt – SSD mal wieder anstecken!", systemImage: "exclamationmark.triangle")
-                    .font(.caption).foregroundStyle(.orange)
+                ForEach(m.sources) { src in sourceRow(src) }
             }
+
+            Divider()
+            HStack {
+                Text("Automatik").foregroundStyle(.secondary)
+                Text(m.paused ? "pausiert" : m.savedSettings.scheduleText)
+                    .foregroundStyle(m.paused ? .orange : .primary)
+            }.font(.caption)
         }
         .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -662,51 +805,116 @@ struct StatusView: View {
     }
 }
 
-// MARK: - Fenster „Ordner“
+// MARK: - Fenster „Quellen & Ordner“
 
 struct FoldersView: View {
     @EnvironmentObject var m: BackupModel
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            if !m.ssdConnected {
-                Label("„\(m.ssdName)“ ist nicht angesteckt – Ordner auswählen geht erst, wenn sie da ist. Entfernen und Muster gehen trotzdem.",
+        HStack(spacing: 0) {
+            // Liste der Quellen
+            VStack(spacing: 0) {
+                List(m.sources, selection: Binding(get: { m.selectedSourceID }, set: {
+                    m.selectedSourceID = $0; m.selInclude = []; m.selExclude = []
+                })) { src in
+                    Label {
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(src.name).lineLimit(1)
+                            Text(src.availability + (src.enabled ? "" : " · deaktiviert"))
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                    } icon: { Image(systemName: src.icon) }
+                    .tag(src.id)
+                    .opacity(src.enabled ? 1 : 0.6)
+                }
+                .listStyle(.sidebar)
+                Divider()
+                HStack(spacing: 2) {
+                    Button { m.addSource() } label: { Image(systemName: "plus").frame(width: 22, height: 18) }
+                        .help("Platte oder Ordner hinzufügen")
+                    Button { if let s = m.selectedSource { m.removeSource(s) } } label: { Image(systemName: "minus").frame(width: 22, height: 18) }
+                        .disabled(m.selectedSource == nil)
+                        .help("Ausgewählte Quelle entfernen")
+                    Spacer()
+                }
+                .buttonStyle(.borderless)
+                .padding(6)
+            }
+            .frame(width: 210)
+
+            Divider()
+
+            if let src = m.selectedSource {
+                detail(src).id(src.id)
+            } else {
+                VStack(spacing: 12) {
+                    Image(systemName: "externaldrive.badge.plus").font(.system(size: 40)).foregroundStyle(.secondary)
+                    Text("Noch keine Quelle eingerichtet").font(.headline)
+                    Button("Platte oder Ordner hinzufügen …") { m.addSource() }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+        .frame(minWidth: 720, minHeight: 560)
+        .onAppear { m.refresh() }
+    }
+
+    @ViewBuilder func detail(_ src: BackupSource) -> some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .top) {
+                Image(systemName: src.icon).font(.title).foregroundStyle(src.connected ? Color.accentColor : .secondary)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(src.name).font(.title3.weight(.semibold))
+                    Text(src.root).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                    Text(src.availability + " · " + (src.lastSuccess.map { "zuletzt gesichert vor \(fmtDuration(Date().timeIntervalSince($0)))" } ?? "noch nie gesichert"))
+                        .font(.caption).foregroundStyle(src.isOld ? .orange : .secondary)
+                }
+                Spacer()
+                VStack(alignment: .trailing, spacing: 6) {
+                    Toggle("Automatisch sichern", isOn: Binding(get: { src.enabled }, set: { m.setEnabled(src, $0) }))
+                        .toggleStyle(.switch).controlSize(.small)
+                    Button { m.startBackup(src) } label: { Label("Jetzt sichern", systemImage: "play.fill") }
+                        .disabled(!src.connected || m.isRunning)
+                }
+            }
+
+            if !src.connected {
+                Label("„\(src.name)“ ist \(src.availability) – Ordner auswählen geht erst, wenn sie da ist. Entfernen und Muster gehen trotzdem.",
                       systemImage: "externaldrive.badge.xmark")
                     .font(.callout).foregroundStyle(.orange)
             }
 
             section(title: "Gesicherte Ordner",
-                    hint: m.includes.isEmpty ? "Leer – die ganze SSD wird gesichert." : "Nur diese Ordner werden gesichert.",
-                    items: m.includes, selection: $m.selInclude, include: true)
+                    hint: src.includes.isEmpty ? (src.root == "/" ? "Leer – die ganze interne Platte wird gesichert (ohne System und Caches). Besser gezielt Ordner wählen." : "Leer – die ganze Quelle wird gesichert.") : "Nur diese Ordner werden gesichert.",
+                    items: src.includes, selection: $m.selInclude, include: true, src: src)
 
             section(title: "Ausgeschlossen",
                     hint: "Diese Ordner/Dateien werden nicht gesichert. Muster mit * gelten überall, z. B. *.tmp",
-                    items: m.excludes, selection: $m.selExclude, include: false)
+                    items: src.excludes, selection: $m.selExclude, include: false, src: src)
 
             HStack {
-                TextField("Muster hinzufügen, z. B. *.tmp oder **/node_modules", text: $m.pattern)
+                TextField("Muster ausschließen, z. B. *.tmp oder **/node_modules", text: $m.pattern)
                     .textFieldStyle(.roundedBorder)
-                    .onSubmit(addPattern)
-                Button("Hinzufügen", action: addPattern).disabled(m.pattern.trimmingCharacters(in: .whitespaces).isEmpty)
+                    .onSubmit { addPattern(src) }
+                Button("Hinzufügen") { addPattern(src) }.disabled(m.pattern.trimmingCharacters(in: .whitespaces).isEmpty)
             }
 
             Text("Tipp: Eine leere Datei „.nobackup“ in einem Ordner schließt ihn ebenfalls aus. Änderungen gelten ab dem nächsten Backup; bereits gesicherte Daten werden nicht neu hochgeladen.")
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
         }
         .padding(20)
-        .frame(minWidth: 480, minHeight: 520)
-        .onAppear { m.refresh() }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
-    func addPattern() {
+    func addPattern(_ src: BackupSource) {
         let p = m.pattern.trimmingCharacters(in: .whitespaces)
         guard !p.isEmpty else { return }
-        m.add([p], include: false)
+        m.add([p], include: false, source: src)
         m.pattern = ""
     }
 
     @ViewBuilder
-    func section(title: String, hint: String, items: [String], selection: Binding<Set<String>>, include: Bool) -> some View {
+    func section(title: String, hint: String, items: [String], selection: Binding<Set<String>>, include: Bool, src: BackupSource) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             Text(title).font(.headline)
             Text(hint).font(.caption).foregroundStyle(.secondary)
@@ -714,12 +922,12 @@ struct FoldersView: View {
                 Label(item, systemImage: item.contains("*") || item.contains("?") ? "asterisk" : "folder")
             }
             .listStyle(.bordered(alternatesRowBackgrounds: true))
-            .frame(minHeight: 110)
+            .frame(minHeight: 100)
             HStack {
-                Button { m.add(m.pickFolders(), include: include) } label: {
+                Button { m.add(m.pickFolders(in: src), include: include, source: src) } label: {
                     Label("Ordner hinzufügen …", systemImage: "plus")
-                }.disabled(!m.ssdConnected)
-                Button { m.remove(selection.wrappedValue, include: include); selection.wrappedValue = [] } label: {
+                }.disabled(!src.connected)
+                Button { m.remove(selection.wrappedValue, include: include, source: src); selection.wrappedValue = [] } label: {
                     Label("Entfernen", systemImage: "minus")
                 }.disabled(selection.wrappedValue.isEmpty)
             }
@@ -826,6 +1034,7 @@ struct SSDBackupApp: App {
         if let i = args.firstIndex(of: "--render"), i + 1 < args.count {
             let dir = args[i + 1]
             let m = BackupModel()
+            var snapLater = false
             func save<V: View>(_ v: V, _ name: String) {
                 let r = ImageRenderer(content: v.environmentObject(m).background(Color(nsColor: .windowBackgroundColor)))
                 r.scale = 2
@@ -835,7 +1044,7 @@ struct SSDBackupApp: App {
                 }
             }
             save(StatusView(), "status.png")
-            save(FoldersView().frame(width: 480, height: 560), "folders.png")
+            snapLater = true
             m.draft = m.savedSettings; m.draft.schedule = "daily"
             // Formulare rendert ImageRenderer nicht – echtes Fenster abfotografieren
             func snapWindow<V: View>(_ v: V, _ size: NSSize, _ name: String) {
@@ -850,6 +1059,7 @@ struct SSDBackupApp: App {
                 }
             }
             _ = NSApplication.shared
+            if snapLater { snapWindow(FoldersView(), NSSize(width: 760, height: 640), "folders.png") }
             snapWindow(SettingsView(), NSSize(width: 480, height: 900), "settings.png")
             m.draft.schedule = "interval"
             snapWindow(SettingsView(), NSSize(width: 480, height: 900), "settings2.png")
@@ -870,7 +1080,7 @@ struct SSDBackupApp: App {
         }
         .menuBarExtraStyle(.window)
 
-        Window("Ordner auswählen", id: "folders") {
+        Window("Quellen & Ordner", id: "folders") {
             FoldersView().environmentObject(model)
         }
         .windowResizability(.contentMinSize)

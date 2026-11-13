@@ -49,26 +49,26 @@ set_setting() {   # set_setting KEY WERT
   mv "$tmp" "$SETTINGS"
 }
 
-# 3) SSD auswählen ------------------------------------------------------------
-step "3/8  Welche SSD soll gesichert werden?"
-if [[ "$SSD_NAME" != "MeineSSD" ]]; then
-  read "keep?    Bisher: '$SSD_NAME' – beibehalten? [J/n]: "
-  [[ "$keep" == [nN]* ]] && SSD_NAME="MeineSSD"
-fi
-if [[ "$SSD_NAME" == "MeineSSD" ]]; then
+# 3) Quellen (Platten/Ordner) ----------------------------------------------
+step "3/8  Was soll gesichert werden?"
+if [[ -n "$("$CMD" sources 2>/dev/null | grep -v 'Noch keine')" ]]; then
+  "$CMD" sources | sed 's/^/  /'
+  ok "Weitere Platten/Ordner: in der App unter „Quellen & Ordner …“ oder mit 'ssd-backup source add'"
+else
   vols=()
   for v in /Volumes/*(N/); do [[ "${v:t}" != "Macintosh HD" ]] && vols+=("${v:t}"); done
   if (( ${#vols} )); then
     print "    Eingehängte Laufwerke:"
     for i in {1..${#vols}}; do print "      $i) ${vols[$i]}"; done
   fi
-  read "ans?    Nummer oder Name eingeben: "
-  if [[ "$ans" == <-> ]] && (( ans >= 1 && ans <= ${#vols} )); then SSD_NAME="${vols[$ans]}"; else SSD_NAME="$ans"; fi
-  [[ -n "$SSD_NAME" ]] || { print "Kein Name angegeben – Abbruch."; exit 1; }
+  read "ans?    Nummer, Name oder Pfad (z. B. ~/Documents) eingeben: "
+  if [[ "$ans" == <-> ]] && (( ans >= 1 && ans <= ${#vols} )); then src="/Volumes/${vols[$ans]}"
+  elif [[ "$ans" == /* || "$ans" == ~* ]]; then src="${~ans}"
+  else src="/Volumes/$ans"; fi
+  [[ -n "$ans" ]] || { print "Nichts angegeben – Abbruch."; exit 1; }
+  "$CMD" source add "$src" | sed 's/^/    /'
+  [[ "$src" == /Volumes/* ]] && set_setting SSD_NAME "${${src#/Volumes/}%%/*}"
 fi
-set_setting SSD_NAME "$SSD_NAME"
-[[ -d "/Volumes/$SSD_NAME" ]] && ok "SSD: /Volumes/$SSD_NAME" \
-  || print "    ⚠︎ /Volumes/$SSD_NAME ist gerade nicht angesteckt – Backup läuft, sobald sie da ist."
 
 # 4) pCloud verbinden ---------------------------------------------------------
 step "4/8  pCloud mit rclone verbinden"
@@ -144,6 +144,7 @@ fi
 
 print -P "\n%F{green}Fertig!%f"
 print "  Hilfe:                       ssd-backup help"
+print "  Weitere Platte/Ordner:       ssd-backup source add"
 print "  Ordner auswählen:            ssd-backup include add"
 print "  Ordner ausschließen:         ssd-backup exclude add"
 print "  Backup jetzt starten:        ssd-backup run --force"
