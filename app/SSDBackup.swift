@@ -242,6 +242,8 @@ final class BackupModel: ObservableObject {
     @Published var repoPath = ""
     @Published var sources: [BackupSource] = []
     @Published var selectedSourceID: String?
+    /// Auswahl in der Seitenleiste des Einstellungsfensters: "source:<id>", "schedule" oder "general"
+    @Published var pane = "schedule"
     @Published var paused = false
     @Published var repairPending = false
     @Published var mounted = false
@@ -344,6 +346,9 @@ final class BackupModel: ObservableObject {
         if all != sources { sources = all }
         if selectedSourceID == nil || !sources.contains(where: { $0.id == selectedSourceID }) {
             selectedSourceID = sources.first?.id
+        }
+        if pane.hasPrefix("source:"), !sources.contains(where: { "source:" + $0.id == pane }) {
+            pane = selectedSourceID.map { "source:" + $0 } ?? "schedule"
         }
         paused = fm.fileExists(atPath: Paths.paused)
         repairPending = fm.fileExists(atPath: Paths.needsRepair)
@@ -568,6 +573,7 @@ final class BackupModel: ObservableObject {
         if r.status != 0 { message = r.output.trimmingCharacters(in: .whitespacesAndNewlines); return }
         if let new = sources.first(where: { !before.contains($0.id) }) {
             selectedSourceID = new.id
+            pane = "source:" + new.id
             selInclude = []; selExclude = []
             if !new.external {
                 message = "„\(new.name)“ hinzugefügt. Für interne Ordner braucht /bin/zsh evtl. Festplattenvollzugriff (Systemeinstellungen → Datenschutz & Sicherheit)."
@@ -585,6 +591,12 @@ final class BackupModel: ObservableObject {
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         runCLI(["source", "remove", source.id])
         refresh()
+    }
+
+    /// Einstellungsfenster auf einer bestimmten Seite öffnen
+    func show(pane p: String) {
+        if p.hasPrefix("source:") { selectedSourceID = String(p.dropFirst(7)); selInclude = []; selExclude = [] }
+        pane = p
     }
 
     func setEnabled(_ source: BackupSource, _ on: Bool) {
@@ -668,8 +680,11 @@ struct StatusView: View {
 
             // Nebenaktionen
             HStack(spacing: 14) {
-                Button { openWindow(id: "folders"); NSApp.activate(ignoringOtherApps: true) } label: {
-                    Label("Quellen & Ordner …", systemImage: "folder.badge.gearshape")
+                Button {
+                    m.show(pane: m.selectedSourceID.map { "source:" + $0 } ?? "schedule")
+                    openWindow(id: "settings"); NSApp.activate(ignoringOtherApps: true)
+                } label: {
+                    Label("Einstellungen …", systemImage: "gearshape")
                 }
                 Button { m.openLog() } label: { Label("Protokoll", systemImage: "doc.text.magnifyingglass") }
                 Spacer()
@@ -677,7 +692,11 @@ struct StatusView: View {
                     Toggle("Automatik pausieren", isOn: Binding(get: { m.paused }, set: { _ in m.togglePause() }))
                     Toggle("App beim Anmelden starten", isOn: Binding(get: { m.autostart }, set: { m.setAutostart($0) }))
                     Divider()
-                    Button("Einstellungen …") { openWindow(id: "settings"); NSApp.activate(ignoringOtherApps: true) }
+                    Button("Quellen & Ordner …") {
+                        m.show(pane: m.selectedSourceID.map { "source:" + $0 } ?? "schedule")
+                        openWindow(id: "settings"); NSApp.activate(ignoringOtherApps: true)
+                    }
+                    Button("Zeitplan …") { m.show(pane: "schedule"); openWindow(id: "settings"); NSApp.activate(ignoringOtherApps: true) }
                     Divider()
                     Button("App beenden") { NSApp.terminate(nil) }
                 } label: { Image(systemName: "gearshape") }
@@ -805,61 +824,97 @@ struct StatusView: View {
     }
 }
 
-// MARK: - Fenster „Quellen & Ordner“
+// MARK: - Fenster „Einstellungen“ (Quellen, Ordner, Zeitplan, Allgemein)
 
-struct FoldersView: View {
+struct SettingsWindow: View {
     @EnvironmentObject var m: BackupModel
 
     var body: some View {
         HStack(spacing: 0) {
-            // Liste der Quellen
-            VStack(spacing: 0) {
-                List(m.sources, selection: Binding(get: { m.selectedSourceID }, set: {
-                    m.selectedSourceID = $0; m.selInclude = []; m.selExclude = []
-                })) { src in
-                    Label {
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text(src.name).lineLimit(1)
-                            Text(src.availability + (src.enabled ? "" : " · deaktiviert"))
-                                .font(.caption).foregroundStyle(.secondary)
-                        }
-                    } icon: { Image(systemName: src.icon) }
-                    .tag(src.id)
-                    .opacity(src.enabled ? 1 : 0.6)
-                }
-                .listStyle(.sidebar)
-                Divider()
-                HStack(spacing: 2) {
-                    Button { m.addSource() } label: { Image(systemName: "plus").frame(width: 22, height: 18) }
-                        .help("Platte oder Ordner hinzufügen")
-                    Button { if let s = m.selectedSource { m.removeSource(s) } } label: { Image(systemName: "minus").frame(width: 22, height: 18) }
-                        .disabled(m.selectedSource == nil)
-                        .help("Ausgewählte Quelle entfernen")
-                    Spacer()
-                }
-                .buttonStyle(.borderless)
-                .padding(6)
-            }
-            .frame(width: 210)
-
+            sidebar.frame(width: 220)
             Divider()
-
-            if let src = m.selectedSource {
-                detail(src).id(src.id)
-            } else {
-                VStack(spacing: 12) {
-                    Image(systemName: "externaldrive.badge.plus").font(.system(size: 40)).foregroundStyle(.secondary)
-                    Text("Noch keine Quelle eingerichtet").font(.headline)
-                    Button("Platte oder Ordner hinzufügen …") { m.addSource() }
+            Group {
+                if m.pane == "schedule" {
+                    SettingsForm(part: .schedule)
+                } else if m.pane == "general" {
+                    SettingsForm(part: .general)
+                } else if let src = m.sources.first(where: { "source:" + $0.id == m.pane }) {
+                    SourceDetail(src: src).id(src.id)
+                } else {
+                    VStack(spacing: 12) {
+                        Image(systemName: "externaldrive.badge.plus").font(.system(size: 40)).foregroundStyle(.secondary)
+                        Text("Noch keine Quelle eingerichtet").font(.headline)
+                        Button("Platte oder Ordner hinzufügen …") { m.addSource() }
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .frame(minWidth: 720, minHeight: 560)
-        .onAppear { m.refresh() }
+        .frame(minWidth: 780, minHeight: 600)
+        .onAppear { m.loadDraft() }
     }
 
-    @ViewBuilder func detail(_ src: BackupSource) -> some View {
+    var sidebar: some View {
+        VStack(spacing: 0) {
+            List(selection: Binding(get: { Optional(m.pane) }, set: { if let p = $0 { m.show(pane: p) } })) {
+                Section("Quellen") {
+                    ForEach(m.sources) { src in
+                        Label {
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(src.name).lineLimit(1)
+                                Text(src.availability + (src.enabled ? "" : " · deaktiviert"))
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
+                        } icon: { Image(systemName: src.icon) }
+                        .tag("source:" + src.id)
+                        .opacity(src.enabled ? 1 : 0.6)
+                    }
+                    if m.sources.isEmpty {
+                        Text("Keine – mit + hinzufügen").font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                Section("Allgemein") {
+                    Label {
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text("Zeitplan")
+                            Text(m.paused ? "pausiert" : m.savedSettings.scheduleText).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                        }
+                    } icon: { Image(systemName: "clock") }
+                    .tag("schedule")
+                    Label("Aufbewahrung & Weiteres", systemImage: "slider.horizontal.3").tag("general")
+                }
+            }
+            .listStyle(.sidebar)
+            Divider()
+            HStack(spacing: 2) {
+                Button { m.addSource() } label: { Image(systemName: "plus").frame(width: 22, height: 18) }
+                    .help("Platte oder Ordner hinzufügen")
+                Button {
+                    if let s = m.sources.first(where: { "source:" + $0.id == m.pane }) { m.removeSource(s) }
+                } label: { Image(systemName: "minus").frame(width: 22, height: 18) }
+                    .disabled(!m.pane.hasPrefix("source:"))
+                    .help("Ausgewählte Quelle entfernen")
+                Spacer()
+                if m.draft != m.savedSettings {
+                    Label("nicht übernommen", systemImage: "circle.fill").labelStyle(.titleAndIcon)
+                        .font(.caption2).foregroundStyle(.orange)
+                        .help("Zeitplan/Einstellungen geändert – mit „Übernehmen“ speichern")
+                }
+            }
+            .buttonStyle(.borderless)
+            .padding(6)
+        }
+    }
+}
+
+// MARK: Seite einer Quelle
+
+struct SourceDetail: View {
+    @EnvironmentObject var m: BackupModel
+    let src: BackupSource
+
+    var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .top) {
                 Image(systemName: src.icon).font(.title).foregroundStyle(src.connected ? Color.accentColor : .secondary)
@@ -886,27 +941,27 @@ struct FoldersView: View {
 
             section(title: "Gesicherte Ordner",
                     hint: src.includes.isEmpty ? (src.root == "/" ? "Leer – die ganze interne Platte wird gesichert (ohne System und Caches). Besser gezielt Ordner wählen." : "Leer – die ganze Quelle wird gesichert.") : "Nur diese Ordner werden gesichert.",
-                    items: src.includes, selection: $m.selInclude, include: true, src: src)
+                    items: src.includes, selection: $m.selInclude, include: true)
 
             section(title: "Ausgeschlossen",
                     hint: "Diese Ordner/Dateien werden nicht gesichert. Muster mit * gelten überall, z. B. *.tmp",
-                    items: src.excludes, selection: $m.selExclude, include: false, src: src)
+                    items: src.excludes, selection: $m.selExclude, include: false)
 
             HStack {
                 TextField("Muster ausschließen, z. B. *.tmp oder **/node_modules", text: $m.pattern)
                     .textFieldStyle(.roundedBorder)
-                    .onSubmit { addPattern(src) }
-                Button("Hinzufügen") { addPattern(src) }.disabled(m.pattern.trimmingCharacters(in: .whitespaces).isEmpty)
+                    .onSubmit(addPattern)
+                Button("Hinzufügen", action: addPattern).disabled(m.pattern.trimmingCharacters(in: .whitespaces).isEmpty)
             }
 
-            Text("Tipp: Eine leere Datei „.nobackup“ in einem Ordner schließt ihn ebenfalls aus. Änderungen gelten ab dem nächsten Backup; bereits gesicherte Daten werden nicht neu hochgeladen.")
+            Text("Tipp: Eine leere Datei „.nobackup“ in einem Ordner schließt ihn ebenfalls aus. Änderungen gelten sofort ab dem nächsten Backup; bereits gesicherte Daten werden nicht neu hochgeladen.")
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
         }
         .padding(20)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
-    func addPattern(_ src: BackupSource) {
+    func addPattern() {
         let p = m.pattern.trimmingCharacters(in: .whitespaces)
         guard !p.isEmpty else { return }
         m.add([p], include: false, source: src)
@@ -914,7 +969,7 @@ struct FoldersView: View {
     }
 
     @ViewBuilder
-    func section(title: String, hint: String, items: [String], selection: Binding<Set<String>>, include: Bool, src: BackupSource) -> some View {
+    func section(title: String, hint: String, items: [String], selection: Binding<Set<String>>, include: Bool) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             Text(title).font(.headline)
             Text(hint).font(.caption).foregroundStyle(.secondary)
@@ -935,69 +990,18 @@ struct FoldersView: View {
     }
 }
 
-// MARK: - Fenster „Einstellungen“
+// MARK: Seiten „Zeitplan“ und „Aufbewahrung & Weiteres“
 
-struct SettingsView: View {
+struct SettingsForm: View {
+    enum Part { case schedule, general }
     @EnvironmentObject var m: BackupModel
+    let part: Part
     static let minHourOptions = [1, 6, 12, 20, 24, 48, 72, 168]
 
     var body: some View {
         VStack(spacing: 0) {
             Form {
-                Section {
-                    Toggle("Beim Einstecken der SSD starten", isOn: $m.draft.runOnMount)
-                    Picker("Regelmäßig", selection: $m.draft.schedule) {
-                        Text("Alle paar Stunden").tag("interval")
-                        Text("Täglich zu einer Uhrzeit").tag("daily")
-                        Text("Nie").tag("none")
-                    }
-                    if m.draft.schedule == "interval" {
-                        Stepper(value: $m.draft.intervalHours, in: 1...24) {
-                            Text(m.draft.intervalHours == 1 ? "Jede Stunde" : "Alle \(m.draft.intervalHours) Stunden")
-                        }
-                    }
-                    if m.draft.schedule == "daily" {
-                        DatePicker("Uhrzeit", selection: $m.draft.dailyDate, displayedComponents: .hourAndMinute)
-                    }
-                    Picker("Höchstens ein Backup alle", selection: $m.draft.minHours) {
-                        ForEach(Self.minHourOptions + (Self.minHourOptions.contains(m.draft.minHours) ? [] : [m.draft.minHours]), id: \.self) {
-                            Text(SettingsDraft.hoursText($0)).tag($0)
-                        }
-                    }
-                    Toggle("Automatik pausieren", isOn: Binding(get: { m.paused }, set: { _ in m.togglePause() }))
-                } header: {
-                    Text("Zeitplan")
-                } footer: {
-                    Text("Zu diesen Zeitpunkten wird ein Backup versucht. Es läuft nur, wenn die SSD angesteckt ist und das letzte erfolgreiche Backup länger als der Mindestabstand her ist. Abgebrochene Backups werden beim nächsten Zeitpunkt fortgesetzt. Schläft der Mac zur Uhrzeit, wird es beim Aufwachen nachgeholt.")
-                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                }
-
-                Section {
-                    Stepper("Tägliche Stände: \(m.draft.keepDaily)", value: $m.draft.keepDaily, in: 0...60)
-                    Stepper("Wöchentliche Stände: \(m.draft.keepWeekly)", value: $m.draft.keepWeekly, in: 0...52)
-                    Stepper("Monatliche Stände: \(m.draft.keepMonthly)", value: $m.draft.keepMonthly, in: 0...120)
-                    Stepper("Jährliche Stände: \(m.draft.keepYearly)", value: $m.draft.keepYearly, in: 0...50)
-                } header: {
-                    Text("Aufbewahrung")
-                } footer: {
-                    Text("Ältere Stände werden einmal pro Woche entfernt.").font(.caption).foregroundStyle(.secondary)
-                }
-
-                Section("Mitteilungen") {
-                    Toggle("Mitteilungen anzeigen", isOn: $m.draft.notifications)
-                    Toggle("Zusätzlich bei 25 / 50 / 75 %", isOn: $m.draft.notifyProgress)
-                        .disabled(!m.draft.notifications)
-                }
-
-                Section {
-                    Stepper("Gleichzeitige Uploads: \(m.draft.connections)", value: $m.draft.connections, in: 1...8)
-                    Button("settings.conf im Texteditor öffnen …") { m.openSettingsFile() }
-                } header: {
-                    Text("Erweitert")
-                } footer: {
-                    Text("Mehr Uploads = schneller, aber pCloud antwortet dann öfter mit Fehlern. 2 ist ein guter Wert.")
-                        .font(.caption).foregroundStyle(.secondary)
-                }
+                if part == .schedule { scheduleSection } else { generalSections }
             }
             .formStyle(.grouped)
 
@@ -1017,8 +1021,69 @@ struct SettingsView: View {
             }
             .padding(12)
         }
-        .frame(minWidth: 460, minHeight: 600)
-        .onAppear { m.loadDraft() }
+    }
+
+    @ViewBuilder var scheduleSection: some View {
+        Section {
+            Toggle("Beim Einstecken einer Platte starten", isOn: $m.draft.runOnMount)
+            Picker("Regelmäßig", selection: $m.draft.schedule) {
+                Text("Alle paar Stunden").tag("interval")
+                Text("Täglich zu einer Uhrzeit").tag("daily")
+                Text("Nie").tag("none")
+            }
+            if m.draft.schedule == "interval" {
+                Stepper(value: $m.draft.intervalHours, in: 1...24) {
+                    Text(m.draft.intervalHours == 1 ? "Jede Stunde" : "Alle \(m.draft.intervalHours) Stunden")
+                }
+            }
+            if m.draft.schedule == "daily" {
+                DatePicker("Uhrzeit", selection: $m.draft.dailyDate, displayedComponents: .hourAndMinute)
+            }
+            Picker("Höchstens ein Backup je Quelle alle", selection: $m.draft.minHours) {
+                ForEach(Self.minHourOptions + (Self.minHourOptions.contains(m.draft.minHours) ? [] : [m.draft.minHours]), id: \.self) {
+                    Text(SettingsDraft.hoursText($0)).tag($0)
+                }
+            }
+            Toggle("Automatik pausieren", isOn: Binding(get: { m.paused }, set: { _ in m.togglePause() }))
+        } header: {
+            Text("Zeitplan")
+        } footer: {
+            Text("Zu diesen Zeitpunkten wird ein Backup versucht – für jede Quelle, die verfügbar ist (externe Platte angesteckt) und deren letztes erfolgreiches Backup länger als der Mindestabstand her ist. Abgebrochene Backups werden beim nächsten Zeitpunkt fortgesetzt. Schläft der Mac zur Uhrzeit, wird es beim Aufwachen nachgeholt. Einzelne Quellen lassen sich auf ihrer Seite von der Automatik ausnehmen.")
+                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    @ViewBuilder var generalSections: some View {
+        Section {
+            Stepper("Tägliche Stände: \(m.draft.keepDaily)", value: $m.draft.keepDaily, in: 0...60)
+            Stepper("Wöchentliche Stände: \(m.draft.keepWeekly)", value: $m.draft.keepWeekly, in: 0...52)
+            Stepper("Monatliche Stände: \(m.draft.keepMonthly)", value: $m.draft.keepMonthly, in: 0...120)
+            Stepper("Jährliche Stände: \(m.draft.keepYearly)", value: $m.draft.keepYearly, in: 0...50)
+        } header: {
+            Text("Aufbewahrung")
+        } footer: {
+            Text("Gilt für jede Quelle getrennt. Ältere Stände werden einmal pro Woche entfernt.").font(.caption).foregroundStyle(.secondary)
+        }
+
+        Section("Mitteilungen") {
+            Toggle("Mitteilungen anzeigen", isOn: $m.draft.notifications)
+            Toggle("Zusätzlich bei 25 / 50 / 75 %", isOn: $m.draft.notifyProgress)
+                .disabled(!m.draft.notifications)
+        }
+
+        Section("App") {
+            Toggle("App beim Anmelden starten", isOn: Binding(get: { m.autostart }, set: { m.setAutostart($0) }))
+        }
+
+        Section {
+            Stepper("Gleichzeitige Uploads: \(m.draft.connections)", value: $m.draft.connections, in: 1...8)
+            Button("settings.conf im Texteditor öffnen …") { m.openSettingsFile() }
+        } header: {
+            Text("Erweitert")
+        } footer: {
+            Text("Mehr Uploads = schneller, aber pCloud antwortet dann öfter mit Fehlern. 2 ist ein guter Wert.")
+                .font(.caption).foregroundStyle(.secondary)
+        }
     }
 }
 
@@ -1059,10 +1124,14 @@ struct SSDBackupApp: App {
                 }
             }
             _ = NSApplication.shared
-            if snapLater { snapWindow(FoldersView(), NSSize(width: 760, height: 640), "folders.png") }
-            snapWindow(SettingsView(), NSSize(width: 480, height: 900), "settings.png")
-            m.draft.schedule = "interval"
-            snapWindow(SettingsView(), NSSize(width: 480, height: 900), "settings2.png")
+            if snapLater {
+                m.show(pane: m.sources.first.map { "source:" + $0.id } ?? "schedule")
+                snapWindow(SettingsWindow(), NSSize(width: 820, height: 680), "folders.png")
+            }
+            m.show(pane: "schedule")
+            snapWindow(SettingsWindow(), NSSize(width: 820, height: 680), "settings.png")
+            m.show(pane: "general")
+            snapWindow(SettingsWindow(), NSSize(width: 820, height: 680), "settings2.png")
             exit(0)
         }
     }
@@ -1080,14 +1149,8 @@ struct SSDBackupApp: App {
         }
         .menuBarExtraStyle(.window)
 
-        Window("Quellen & Ordner", id: "folders") {
-            FoldersView().environmentObject(model)
-        }
-        .windowResizability(.contentMinSize)
-        .defaultLaunchBehavior(.suppressed)
-
-        Window("Einstellungen", id: "settings") {
-            SettingsView().environmentObject(model)
+        Window("SSD-Backup – Einstellungen", id: "settings") {
+            SettingsWindow().environmentObject(model)
         }
         .windowResizability(.contentMinSize)
         .defaultLaunchBehavior(CommandLine.arguments.contains("--settings") ? .presented : .suppressed)

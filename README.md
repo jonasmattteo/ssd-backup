@@ -31,10 +31,12 @@ und startet sie beim Anmelden. Ein Klick auf das Laufwerk-Symbol oben rechts zei
 - **Backup starten** (alle verfügbaren Quellen) / **Abbrechen** (bereits Hochgeladenes bleibt erhalten)
 - **Durchstöbern**: hängt das Backup im Finder ein und öffnet die Übersicht aller Stände;
   ⏏︎ hängt es wieder aus
-- **Quellen & Ordner …**: Platten/Ordner hinzufügen (+) oder entfernen (−), je Quelle
-  gesicherte und ausgeschlossene Ordner per Finder-Auswahl verwalten
-- **Protokoll**, ⚙︎ für Automatik pausieren, Autostart und **Einstellungen**
-  (Zeitplan, Mindestabstand, Aufbewahrung, Mitteilungen, gleichzeitige Uploads)
+- **Einstellungen …**: ein Fenster für alles – links die Seitenleiste mit
+  - **Quellen**: Platten/Ordner hinzufügen (+) oder entfernen (−); je Quelle
+    gesicherte und ausgeschlossene Ordner, „Automatisch sichern“, „Jetzt sichern“
+  - **Zeitplan**: beim Einstecken, alle X Stunden oder täglich, Mindestabstand, pausieren
+  - **Aufbewahrung & Weiteres**: Stände behalten, Mitteilungen, Autostart, Uploads
+- **Protokoll**, ⚙︎ als Abkürzung zu Quellen, Zeitplan, Pausieren und Beenden
 
 Während des Backups zeigt das Symbol die Prozentzahl an. Neu bauen nach
 Änderungen: `zsh app/build.sh`
@@ -143,7 +145,7 @@ Die Dateien liegen in `~/.config/ssd-backup/`: `settings.conf` und je Quelle
 - Sofort: `ssd-backup run --force`
 
 Das ist die Standardeinstellung. Ändern lässt sie sich in der App unter
-⚙︎ → Einstellungen, oder im Terminal:
+Einstellungen → Zeitplan, oder im Terminal:
 ```bash
 ssd-backup schedule                                   # aktuellen Zeitplan anzeigen
 ssd-backup set SCHEDULE daily DAILY_TIME 03:00        # täglich um 3 Uhr
