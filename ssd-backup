@@ -953,7 +953,10 @@ cmd_browse() {
     log "Einhängen: Ordner $mp nicht anlegbar: $(tail -n1 "$err")"; cat "$err" >&2; return 1
   fi
   log "Einhängen nach $mp …"
-  command restic -o rclone.connections=${RCLONE_CONNECTIONS:-2} mount "$mp" 2>>"$err"; rc=$?
+  # Cache immer lokal: liegt er auf einer externen Platte und wird die
+  # abgesteckt, hängt der Mount (und alles, was hineinschaut) dauerhaft.
+  RESTIC_CACHE_DIR="$HOME/Library/Caches/ssd-backup-restic" \
+    command restic -o rclone.connections=${RCLONE_CONNECTIONS:-2} mount "$mp" 2>>"$err"; rc=$?
   if (( rc )); then
     log "Einhängen fehlgeschlagen (Exit $rc):"; sed 's/^/    /' "$err" >> "$LOG_FILE"; cat "$err" >&2
   else

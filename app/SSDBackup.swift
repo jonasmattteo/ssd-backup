@@ -66,6 +66,40 @@ func fmtDuration(_ seconds: Double) -> String {
     return "\(s / 86400) Tg. \(s % 86400 / 3600) Std."
 }
 
+/// Eingehängte Dateisysteme aus der Mount-Tabelle des Kernels (MNT_NOWAIT:
+/// fragt kein Dateisystem ab – blockiert also nie, auch nicht bei hängendem
+/// macFUSE oder schlafender Festplatte).
+func mountedPaths() -> Set<String> {
+    let n = getfsstat(nil, 0, MNT_NOWAIT)
+    guard n > 0 else { return [] }
+    let cap = Int(n) + 8
+    let buf = UnsafeMutablePointer<statfs>.allocate(capacity: cap)
+    defer { buf.deallocate() }
+    let c = getfsstat(buf, Int32(cap * MemoryLayout<statfs>.stride), MNT_NOWAIT)
+    guard c > 0 else { return [] }
+    var out = Set<String>()
+    for i in 0..<Int(c) {
+        var on = buf[i].f_mntonname
+        let size = MemoryLayout.size(ofValue: on)
+        let path = withUnsafePointer(to: &on) {
+            $0.withMemoryRebound(to: CChar.self, capacity: size) { String(cString: $0) }
+        }
+        out.insert(path)
+    }
+    return out
+}
+
+/// Ist der Pfad erreichbar? /Volumes/<Name> wird nur über die Mount-Tabelle
+/// geprüft, damit eine schlafende Platte nicht erst anlaufen muss.
+func pathAvailable(_ root: String, mounts: Set<String>) -> Bool {
+    if root.isEmpty { return false }
+    let comps = root.split(separator: "/")
+    if root.hasPrefix("/Volumes/"), comps.count == 2 { return mounts.contains(root) }
+    if root.hasPrefix("/Volumes/"), comps.count > 2, !mounts.contains("/Volumes/" + comps[1]) { return false }
+    var isDir: ObjCBool = false
+    return FileManager.default.fileExists(atPath: root, isDirectory: &isDir) && isDir.boolValue
+}
+
 func symbol(_ name: String, fallback: String = "externaldrive") -> String {
     NSImage(systemSymbolName: name, accessibilityDescription: nil) != nil ? name : fallback
 }
@@ -142,14 +176,13 @@ struct BackupSource: Identifiable, Equatable {
         return nil
     }
 
-    static func loadAll() -> [BackupSource] {
+    static func loadAll(mounts: Set<String> = mountedPaths()) -> [BackupSource] {
         let fm = FileManager.default
         let ids = ((try? fm.contentsOfDirectory(atPath: Paths.sourcesDir)) ?? []).sorted()
         return ids.compactMap { id in
             guard let text = try? String(contentsOfFile: Paths.sourcesDir + "/\(id)/source.conf", encoding: .utf8) else { return nil }
             let root = value(text, "ROOT") ?? ""
-            var isDir: ObjCBool = false
-            let connected = !root.isEmpty && fm.fileExists(atPath: root, isDirectory: &isDir) && isDir.boolValue
+            let connected = pathAvailable(root, mounts: mounts)
             let state = Paths.sourcesState + "/\(id)"
             var last: Date?
             if let t = try? String(contentsOfFile: state + "/last_success", encoding: .utf8),
@@ -276,7 +309,7 @@ final class BackupModel: ObservableObject {
     init() {
         refresh()
         timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.refresh() }
+            Task { @MainActor in self?.refreshInBackground() }
         }
         // kurz nach dem Start und dann alle 6 Stunden auf Updates prüfen
         DispatchQueue.main.asyncAfter(deadline: .now() + 20) { [weak self] in self?.checkForUpdate() }
@@ -378,45 +411,99 @@ final class BackupModel: ObservableObject {
         }
     }
 
-    func refresh() {
+    /// Alles, was refresh() von der Platte liest – ohne UI-Zustand.
+    struct Snapshot {
+        var cliMissing = false
+        var settings: [String: String]?
+        var status: [String: String] = [:]
+        var lastRun: [String: String] = [:]
+        var lastSuccess: Date?
+        var sources: [BackupSource] = []
+        var paused = false
+        var repairPending = false
+        var mounted = false
+        var autostart = false
+        var updateVersion: String?
+    }
+
+    nonisolated static func gather() -> Snapshot {
         let fm = FileManager.default
-        cliMissing = !fm.fileExists(atPath: Paths.cli)
+        var g = Snapshot()
+        g.cliMissing = !fm.fileExists(atPath: Paths.cli)
         if let s = try? String(contentsOfFile: Paths.settings, encoding: .utf8) {
             var d: [String: String] = [:]
             for line in s.split(separator: "\n") {
                 let l = line.trimmingCharacters(in: .whitespaces)
                 guard !l.hasPrefix("#"), let eq = l.firstIndex(of: "=") else { continue }
                 let key = String(l[..<eq])
-                if let v = Self.settingValue(line, key: key) { d[key] = v }
+                if let v = settingValue(line, key: key) { d[key] = v }
             }
+            g.settings = d
+        }
+        g.status = readJSON(Paths.statusJSON)
+        g.lastRun = readJSON(Paths.lastRunJSON)
+        if let t = try? String(contentsOfFile: Paths.lastSuccess, encoding: .utf8),
+           let ts = Double(t.trimmingCharacters(in: .whitespacesAndNewlines)) {
+            g.lastSuccess = Date(timeIntervalSince1970: ts)
+        }
+        let mounts = mountedPaths()
+        g.sources = BackupSource.loadAll(mounts: mounts)
+        g.paused = fm.fileExists(atPath: Paths.paused)
+        g.repairPending = fm.fileExists(atPath: Paths.needsRepair)
+        // nicht in den Mount hineinschauen: hängt restic, blockiert das bis zu 60 s
+        g.mounted = mounts.contains(Paths.mountPoint)
+        g.autostart = fm.fileExists(atPath: Paths.appAgent)
+        g.updateVersion = (try? String(contentsOfFile: Paths.stateDir + "/update_available", encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return g
+    }
+
+    func apply(_ g: Snapshot) {
+        cliMissing = g.cliMissing
+        if let d = g.settings {
             if d != settings { settings = d }
             if let v = d["REPO_PATH"] { repoPath = v }
         }
-        status = readJSON(Paths.statusJSON)
-        lastRun = readJSON(Paths.lastRunJSON)
-        if let t = try? String(contentsOfFile: Paths.lastSuccess, encoding: .utf8),
-           let ts = Double(t.trimmingCharacters(in: .whitespacesAndNewlines)) {
-            lastSuccess = Date(timeIntervalSince1970: ts)
-        } else { lastSuccess = nil }
-        let all = BackupSource.loadAll()
-        if all != sources { sources = all }
+        if g.status != status { status = g.status }
+        if g.lastRun != lastRun { lastRun = g.lastRun }
+        if g.lastSuccess != lastSuccess { lastSuccess = g.lastSuccess }
+        if g.sources != sources { sources = g.sources }
         if selectedSourceID == nil || !sources.contains(where: { $0.id == selectedSourceID }) {
             selectedSourceID = sources.first?.id
         }
         if pane.hasPrefix("source:"), !sources.contains(where: { "source:" + $0.id == pane }) {
             pane = selectedSourceID.map { "source:" + $0 } ?? "schedule"
         }
-        paused = fm.fileExists(atPath: Paths.paused)
-        repairPending = fm.fileExists(atPath: Paths.needsRepair)
-        mounted = fm.fileExists(atPath: Paths.mountPoint + "/snapshots")
+        if g.paused != paused { paused = g.paused }
+        if g.repairPending != repairPending { repairPending = g.repairPending }
+        if g.mounted != mounted { mounted = g.mounted }
         if mounted { mounting = false }
-        autostart = fm.fileExists(atPath: Paths.appAgent)
-        let uv = (try? String(contentsOfFile: Paths.stateDir + "/update_available", encoding: .utf8))?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        updateVersion = (uv?.isEmpty ?? true) || uv == appVersion ? nil : uv
+        if g.autostart != autostart { autostart = g.autostart }
+        let uv = g.updateVersion
+        let newUV = (uv?.isEmpty ?? true) || uv == appVersion ? nil : uv
+        if newUV != updateVersion { updateVersion = newUV }
     }
 
-    static func settingValue(_ line: Substring, key: String) -> String? {
+    /// Sofort einlesen (nach eigenen Aktionen).
+    func refresh() { apply(Self.gather()) }
+
+    private var refreshing = false
+    private let ioQueue = DispatchQueue(label: "ssd-backup.refresh", qos: .utility)
+
+    /// Regelmäßige Aktualisierung im Hintergrund, damit die Menüleiste nie hängt.
+    func refreshInBackground() {
+        guard !refreshing else { return }
+        refreshing = true
+        ioQueue.async {
+            let g = Self.gather()
+            DispatchQueue.main.async {
+                self.apply(g)
+                self.refreshing = false
+            }
+        }
+    }
+
+    nonisolated static func settingValue(_ line: Substring, key: String) -> String? {
         let l = line.trimmingCharacters(in: .whitespaces)
         guard l.hasPrefix(key + "=") else { return nil }
         var v = String(l.dropFirst(key.count + 1))
@@ -483,7 +570,7 @@ final class BackupModel: ObservableObject {
         Task { @MainActor in
             for _ in 0..<180 {   // großer Index über pCloud kann dauern
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
-                if FileManager.default.fileExists(atPath: Paths.mountPoint + "/snapshots") {
+                if mountedPaths().contains(Paths.mountPoint) {
                     self.refresh(); self.openSnapshots(); return
                 }
                 if self.mountProcess == nil { break }
@@ -509,18 +596,21 @@ final class BackupModel: ObservableObject {
     }
 
     func unmount() {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/sbin/umount")
-        p.arguments = [Paths.mountPoint]
-        try? p.run(); p.waitUntilExit()
-        if p.terminationStatus != 0 {
-            let d = Process()
-            d.executableURL = URL(fileURLWithPath: "/usr/sbin/diskutil")
-            d.arguments = ["unmount", "force", Paths.mountPoint]
-            try? d.run(); d.waitUntilExit()
+        let proc = mountProcess
+        DispatchQueue.global(qos: .userInitiated).async {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/sbin/umount")
+            p.arguments = [Paths.mountPoint]
+            try? p.run(); p.waitUntilExit()
+            if p.terminationStatus != 0 {
+                let d = Process()
+                d.executableURL = URL(fileURLWithPath: "/usr/sbin/diskutil")
+                d.arguments = ["unmount", "force", Paths.mountPoint]
+                try? d.run(); d.waitUntilExit()
+            }
+            proc?.interrupt()
+            DispatchQueue.main.async { self.refresh() }
         }
-        mountProcess?.interrupt()
-        refresh()
     }
 
     func openLog() {
