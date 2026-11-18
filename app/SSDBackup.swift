@@ -413,7 +413,7 @@ final class BackupModel: ObservableObject {
         p.executableURL = URL(fileURLWithPath: "/bin/zsh")
         p.arguments = [Paths.cli, "browse", Paths.mountPoint]
         p.standardOutput = FileHandle.nullDevice
-        p.standardError = FileHandle(forWritingAtPath: Paths.log) ?? FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice   // die CLI schreibt Fehler selbst ins Protokoll
         p.terminationHandler = { _ in
             Task { @MainActor in self.mounting = false; self.mountProcess = nil; self.refresh() }
         }
@@ -422,14 +422,24 @@ final class BackupModel: ObservableObject {
         }
         // warten, bis die Ordner erscheinen, dann Finder öffnen
         Task { @MainActor in
-            for _ in 0..<60 {
+            for _ in 0..<180 {   // großer Index über pCloud kann dauern
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
                 if FileManager.default.fileExists(atPath: Paths.mountPoint + "/snapshots") {
                     self.refresh(); self.openSnapshots(); return
                 }
                 if self.mountProcess == nil { break }
             }
-            if !self.mounted { self.message = "Einhängen hat nicht geklappt – siehe Protokoll." }
+            if !self.mounted {
+                let err = (try? String(contentsOfFile: Paths.stateDir + "/mount.err", encoding: .utf8)) ?? ""
+                let last = err.split(separator: "\n").last.map(String.init) ?? ""
+                if self.mountProcess != nil {
+                    self.message = "Einhängen dauert ungewöhnlich lange – läuft im Hintergrund weiter."
+                } else if !last.isEmpty {
+                    self.message = "Einhängen fehlgeschlagen: \(last)"
+                } else {
+                    self.message = "Einhängen hat nicht geklappt – siehe Protokoll."
+                }
+            }
             self.mounting = false
         }
     }

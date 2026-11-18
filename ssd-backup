@@ -937,6 +937,28 @@ PLIST
 # ---------------------------------------------------------------------------
 #  Hilfe & Dispatcher
 # ---------------------------------------------------------------------------
+# Backup im Finder einhängen. Fehler landen im Protokoll und in mount.err
+# (die App zeigt die letzte Zeile davon an).
+cmd_browse() {
+  local mp="${1:-$HOME/restic-mount}" err="$STATE_DIR/mount.err" rc
+  mkdir -p "$STATE_DIR"; : > "$err"
+  if [[ ! -d /Library/Filesystems/macfuse.fs ]]; then
+    print -r -- "macFUSE ist nicht installiert – zum Durchstöbern nötig: brew install --cask macfuse (danach Systemerweiterung erlauben und neu starten)" | tee "$err" >&2
+    log "Einhängen: macFUSE fehlt"; return 1
+  fi
+  if ! mkdir -p "$mp" 2>>"$err"; then
+    log "Einhängen: Ordner $mp nicht anlegbar: $(tail -n1 "$err")"; cat "$err" >&2; return 1
+  fi
+  log "Einhängen nach $mp …"
+  command restic -o rclone.connections=${RCLONE_CONNECTIONS:-2} mount "$mp" 2>>"$err"; rc=$?
+  if (( rc )); then
+    log "Einhängen fehlgeschlagen (Exit $rc):"; sed 's/^/    /' "$err" >> "$LOG_FILE"; cat "$err" >&2
+  else
+    log "Backup ausgehängt."
+  fi
+  return $rc
+}
+
 cmd_help() {
   cat <<'EOF'
 ssd-backup – verschlüsseltes Backup von Platten/Ordnern nach pCloud
@@ -998,8 +1020,7 @@ case $cmd in
                       else print "Es läuft kein Backup."; fi ;;
   pause)              touch "$STATE_DIR/paused"; print "Automatik pausiert (manueller Start geht weiterhin)." ;;
   resume)             rm -f "$STATE_DIR/paused"; print "Automatik wieder aktiv." ;;
-  browse|mount)       mp="${1:-$HOME/restic-mount}"; mkdir -p "$mp"
-                      exec command restic -o rclone.connections=${RCLONE_CONNECTIONS:-2} mount "$mp" ;;
+  browse|mount)       cmd_browse "$@" ;;
   set)                cmd_set "$@" ;;
   schedule)           cmd_schedule "$@" ;;
   help|-h|--help)     cmd_help ;;
