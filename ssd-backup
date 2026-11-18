@@ -8,6 +8,9 @@
 
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
+SSD_BACKUP_VERSION="1.0.0"              # wird von release.sh gesetzt
+UPDATE_REPO="jonasmattteo/ssd-backup"   # GitHub-Repo für Updates
+
 CONF_DIR="$HOME/.config/ssd-backup"
 SETTINGS="$CONF_DIR/settings.conf"
 SOURCES_DIR="$CONF_DIR/sources"         # eine Unterordner pro Quelle (Platte/Ordner)
@@ -959,6 +962,58 @@ cmd_browse() {
   return $rc
 }
 
+# ---------------------------------------------------------------------------
+#  Updates aus GitHub-Releases
+# ---------------------------------------------------------------------------
+# Neuestes Release abfragen → REL_VERSION, REL_ASSET (API-URL der ZIP-Datei)
+fetch_release() {
+  local json hdr=(-H "Accept: application/vnd.github+json")
+  [[ -n "$GITHUB_TOKEN" ]] && hdr+=(-H "Authorization: Bearer $GITHUB_TOKEN")
+  json=$(curl -fsSL --max-time 20 "${hdr[@]}" "https://api.github.com/repos/$UPDATE_REPO/releases/latest" 2>/dev/null) || return 1
+  REL_VERSION=$(jq -r '.tag_name // empty' <<<"$json"); REL_VERSION=${REL_VERSION#v}
+  REL_ASSET=$(jq -r '[.assets[]? | select(.name | test("^ssd-backup-.*\\.zip$"))][0].url // empty' <<<"$json")
+  [[ -n "$REL_VERSION" && -n "$REL_ASSET" ]]
+}
+version_newer() { autoload -Uz is-at-least; [[ "$1" != "$2" ]] && is-at-least "$2" "$1"; }   # $1 neuer als $2?
+
+# ssd-backup update [--check]
+#   --check: nur nachsehen (Exit 0 = Update da, 1 = aktuell, 2 = Fehler)
+cmd_update() {
+  local check=0 uf="$STATE_DIR/update_available" pid tmp dir rc; local -a hdr
+  [[ "$1" == --check ]] && check=1
+  if ! fetch_release; then
+    print -u2 "Konnte das neueste Release auf GitHub nicht abrufen (offline?)."; return 2
+  fi
+  if ! version_newer "$REL_VERSION" "$SSD_BACKUP_VERSION"; then
+    rm -f "$uf"; print "Aktuell – Version $SSD_BACKUP_VERSION."
+    (( check )) && return 1; return 0
+  fi
+  print -r -- "$REL_VERSION" > "$uf"
+  if (( check )); then print "Update verfügbar: $SSD_BACKUP_VERSION → $REL_VERSION"; return 0; fi
+
+  pid=$(cat "$LOCK_DIR/pid" 2>/dev/null)
+  if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+    print -u2 "Es läuft gerade ein Backup – das Update bitte danach starten."; return 3
+  fi
+  tmp=$(mktemp -d)
+  hdr=(-H "Accept: application/octet-stream")
+  [[ -n "$GITHUB_TOKEN" ]] && hdr+=(-H "Authorization: Bearer $GITHUB_TOKEN")
+  print "Lade Version $REL_VERSION …"
+  if ! curl -fsSL --max-time 600 "${hdr[@]}" -o "$tmp/release.zip" "$REL_ASSET" \
+     || ! ditto -x -k "$tmp/release.zip" "$tmp/x"; then
+    print -u2 "Download fehlgeschlagen."; log "Update auf $REL_VERSION: Download fehlgeschlagen"; rm -rf "$tmp"; return 2
+  fi
+  dir="$tmp/x/ssd-backup"
+  if [[ ! -f "$dir/ssd-backup" || ! -f "$dir/install.sh" ]]; then
+    print -u2 "Das Paket ist unvollständig."; log "Update auf $REL_VERSION: Paket unvollständig"; rm -rf "$tmp"; return 2
+  fi
+  log "Update $SSD_BACKUP_VERSION → $REL_VERSION …"
+  zsh "$dir/install.sh" --update 2>&1 | tee -a "$LOG_FILE"; rc=${pipestatus[1]}
+  rm -rf "$tmp"
+  if (( rc )); then log "Update fehlgeschlagen (Exit $rc)"; else rm -f "$uf"; log "Update auf $REL_VERSION fertig."; fi
+  return $rc
+}
+
 cmd_help() {
   cat <<'EOF'
 ssd-backup – verschlüsseltes Backup von Platten/Ordnern nach pCloud
@@ -986,6 +1041,9 @@ ssd-backup – verschlüsseltes Backup von Platten/Ordnern nach pCloud
   ssd-backup edit              Einstellungen + Listen im Texteditor öffnen
   ssd-backup set KEY WERT      Einstellung ändern, z. B.: set SCHEDULE daily DAILY_TIME 03:00
   ssd-backup schedule [apply]  Zeitplan anzeigen / nach Änderung aktivieren
+
+  ssd-backup update [--check]  auf neue Version prüfen und installieren
+  ssd-backup version           installierte Version anzeigen
 
   ssd-backup snapshots         alle gesicherten Stände
   ssd-backup log               Protokoll live ansehen
@@ -1023,6 +1081,8 @@ case $cmd in
   browse|mount)       cmd_browse "$@" ;;
   set)                cmd_set "$@" ;;
   schedule)           cmd_schedule "$@" ;;
+  update)             cmd_update "$@" ;;
+  version|--version)  print -r -- "$SSD_BACKUP_VERSION" ;;
   help|-h|--help)     cmd_help ;;
   --force)            cmd_run --force ;;   # Kompatibilität mit altem Aufruf
   *)                  print "Unbekannter Befehl: $cmd\n"; cmd_help; exit 1 ;;

@@ -4,14 +4,32 @@ Sichert externe Platten, interne Platten oder einzelne Ordner mit **restic**
 (Verschlüsselung + Versionen) über **rclone** nach pCloud. **launchd** startet
 das Backup automatisch.
 
-## Einrichten / Aktualisieren
+## Installieren
 
-SSD anstecken, dann im Terminal:
+Voraussetzung: [Homebrew](https://brew.sh). Die Platte anstecken, dann im Terminal:
 ```bash
-cd ~/Documents/SSD-Backup/ssd-backup && zsh install.sh
+zsh -c "$(curl -fsSL https://github.com/jonasmattteo/ssd-backup/releases/latest/download/get.sh)"
 ```
-Der Installer ist auch für Updates da: Vorhandenes (pCloud-Verbindung,
-Passwort, SSD-Name, Ordnerlisten) bleibt erhalten.
+Das lädt das neueste [Release](https://github.com/jonasmattteo/ssd-backup/releases)
+und startet die Einrichtung. Sie installiert restic, rclone, jq und auf Wunsch
+macFUSE, fragt nach der Platte, verbindet pCloud und legt das Passwort im
+Schlüsselbund ab. Die Menüleisten-App ist fertig gebaut dabei (Apple Silicon und Intel).
+
+Ohne Terminal-Einzeiler: `ssd-backup-<version>.zip` aus dem Release laden,
+entpacken und im Terminal `zsh install.sh` im entpackten Ordner ausführen.
+
+## Aktualisieren
+
+Die App prüft alle 6 Stunden auf neue Versionen und zeigt dann
+**„Version X ist verfügbar – Aktualisieren“**. Manuell: ⚙︎ → **Nach Updates suchen**,
+oder im Terminal:
+```bash
+ssd-backup update          # prüfen und installieren
+ssd-backup update --check  # nur prüfen
+```
+Ein Update ersetzt nur Programm und App. Quellen, Ordnerlisten, Einstellungen,
+pCloud-Verbindung und Passwort bleiben unverändert. Während ein Backup läuft,
+wird nicht aktualisiert.
 
 **Passwort zusätzlich im Passwort-Manager sichern.** Ohne es ist das Backup
 unlesbar – auch für pCloud.
@@ -23,7 +41,7 @@ unlesbar – auch für pCloud.
 
 ## Menüleisten-App „SSD-Backup“
 
-Der Installer baut eine kleine App für die Menüleiste (`~/Applications/SSD-Backup.app`)
+Der Installer legt eine kleine App für die Menüleiste an (`~/Applications/SSD-Backup.app`)
 und startet sie beim Anmelden. Ein Klick auf das Laufwerk-Symbol oben rechts zeigt:
 
 - Zustand, Fortschritt mit Restzeit und welche Quelle gerade gesichert wird
@@ -36,7 +54,7 @@ und startet sie beim Anmelden. Ein Klick auf das Laufwerk-Symbol oben rechts zei
     gesicherte und ausgeschlossene Ordner, „Automatisch sichern“, „Jetzt sichern“
   - **Zeitplan**: beim Einstecken, alle X Stunden oder täglich, Mindestabstand, pausieren
   - **Aufbewahrung & Weiteres**: Stände behalten, Mitteilungen, Autostart, Uploads
-- **Protokoll**, ⚙︎ als Abkürzung zu Quellen, Zeitplan, Pausieren und Beenden
+- **Protokoll**, ⚙︎ als Abkürzung zu Quellen, Zeitplan, Pausieren, Updates und Beenden
 
 Während des Backups zeigt das Symbol die Prozentzahl an. Neu bauen nach
 Änderungen: `zsh app/build.sh`
@@ -199,3 +217,16 @@ rm ~/Library/LaunchAgents/com.user.ssd-backup.plist ~/bin/ssd-backup
 ```
 (Backup in pCloud, Passwort im Schlüsselbund und `~/.config/ssd-backup`
 bleiben erhalten.)
+
+## Entwicklung & Releases
+
+Aus dem Git-Checkout installieren: `zsh install.sh` (baut die App selbst,
+braucht dafür `xcode-select --install`).
+
+Neue Version veröffentlichen (braucht `gh auth login`):
+```bash
+./release.sh 1.2.0 --publish
+```
+Das setzt die Versionsnummer, baut die App für beide Prozessoren, packt
+`ssd-backup-1.2.0.zip`, taggt `v1.2.0` und legt das GitHub-Release an.
+Ohne `--publish` landet das Paket nur in `dist/`.

@@ -3,11 +3,15 @@
 #  install.sh – richtet das SSD-Backup nach pCloud ein (oder aktualisiert es).
 #  Kann gefahrlos mehrfach ausgeführt werden: erledigte Schritte werden
 #  übersprungen, vorhandene Einstellungen und Ordnerlisten bleiben erhalten.
+#
+#  install.sh --update   nur Programm + App ersetzen, keine Rückfragen
+#                        (wird von 'ssd-backup update' benutzt)
 # ============================================================================
 set -e
 export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 
 HERE="${0:A:h}"
+UPDATE=0; [[ "$1" == --update ]] && UPDATE=1
 LABEL="com.user.ssd-backup"
 BIN_DIR="$HOME/bin"
 CMD="$BIN_DIR/ssd-backup"
@@ -22,8 +26,24 @@ ok()   { print -P "    %F{green}✓%f $*"; }
 # 1) Programme ----------------------------------------------------------------
 step "1/8  restic, rclone und jq installieren"
 for tool in restic rclone jq; do
-  if command -v $tool >/dev/null; then ok "$tool vorhanden"; else brew install $tool; fi
+  if command -v $tool >/dev/null; then ok "$tool vorhanden"; continue; fi
+  if ! command -v brew >/dev/null; then
+    print "    Homebrew fehlt. Erst installieren (https://brew.sh):"
+    print '    /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"'
+    print "    und danach dieses Skript erneut starten."
+    exit 1
+  fi
+  brew install $tool
 done
+if [[ -d /Library/Filesystems/macfuse.fs ]]; then
+  ok "macFUSE vorhanden (zum Durchstöbern)"
+elif (( ! UPDATE )); then
+  read "fuse?    macFUSE installieren? Wird nur zum Durchstöbern im Finder gebraucht. [J/n]: "
+  if [[ "$fuse" != [nN]* ]]; then
+    brew install --cask macfuse
+    print "    Wichtig: unter Systemeinstellungen → Datenschutz & Sicherheit die Systemerweiterung erlauben und den Mac neu starten."
+  fi
+fi
 
 # 2) Befehl installieren + Standard-Konfiguration anlegen ----------------------
 step "2/8  Befehl 'ssd-backup' installieren"
@@ -35,7 +55,7 @@ ok "Einstellungen: $CONF_DIR"
 source "$SETTINGS"
 
 # Werte aus der alten Version (ssd-backup.sh) übernehmen
-if [[ -f "$OLD_SCRIPT" ]]; then
+if (( ! UPDATE )) && [[ -f "$OLD_SCRIPT" ]]; then
   old_name=$(sed -n 's/^SSD_NAME="\(.*\)".*/\1/p' "$OLD_SCRIPT" | head -1)
   if [[ -n "$old_name" && "$SSD_NAME" == "MeineSSD" ]]; then
     SSD_NAME="$old_name"
@@ -49,6 +69,9 @@ set_setting() {   # set_setting KEY WERT
   mv "$tmp" "$SETTINGS"
 }
 
+if (( UPDATE )); then
+  print "\n    (Update: Quellen, pCloud, Passwort und Repository bleiben unverändert)"
+else
 # 3) Quellen (Platten/Ordner) ----------------------------------------------
 step "3/8  Was soll gesichert werden?"
 if [[ -n "$("$CMD" sources 2>/dev/null | grep -v 'Noch keine')" ]]; then
@@ -103,6 +126,7 @@ else
   "$CMD" restic init
   ok "Repository angelegt: pCloud → $REPO_PATH"
 fi
+fi   # UPDATE
 
 # 7) launchd ------------------------------------------------------------------
 step "7/8  Automatik einrichten"
@@ -113,7 +137,7 @@ ok "launchd-Job '$LABEL' aktiv"
 if [[ -f "$OLD_SCRIPT" ]]; then rm -f "$OLD_SCRIPT"; ok "alte Version ssd-backup.sh entfernt"; fi
 
 # ~/bin in den PATH, damit 'ssd-backup' überall funktioniert
-if [[ ":$PATH:" != *":$BIN_DIR:"* ]] && ! grep -qs 'HOME/bin' "$HOME/.zshrc"; then
+if (( ! UPDATE )) && [[ ":$PATH:" != *":$BIN_DIR:"* ]] && ! grep -qs 'HOME/bin' "$HOME/.zshrc"; then
   read "addp?    '~/bin' zum PATH in ~/.zshrc hinzufügen (damit 'ssd-backup' direkt geht)? [J/n]: "
   if [[ "$addp" != [nN]* ]]; then
     print '\nexport PATH="$HOME/bin:$PATH"   # ssd-backup' >> "$HOME/.zshrc"
@@ -122,9 +146,27 @@ if [[ ":$PATH:" != *":$BIN_DIR:"* ]] && ! grep -qs 'HOME/bin' "$HOME/.zshrc"; th
 fi
 
 # 8) Menüleisten-App ----------------------------------------------------------
-step "8/8  Menüleisten-App bauen"
-if command -v swiftc >/dev/null; then
+step "8/8  Menüleisten-App"
+APP_DEST="$HOME/Applications/SSD-Backup.app"
+have_app=0
+if [[ -d "$HERE/SSD-Backup.app" ]]; then
+  # fertig gebaute App aus dem Release-Paket
+  was_running=0; pgrep -x SSD-Backup >/dev/null && was_running=1
+  mkdir -p "${APP_DEST:h}"
+  pkill -x SSD-Backup 2>/dev/null && sleep 1 || true
+  rm -rf "$APP_DEST"
+  ditto "$HERE/SSD-Backup.app" "$APP_DEST"
+  xattr -dr com.apple.quarantine "$APP_DEST" 2>/dev/null || true
+  (( ! UPDATE || was_running )) && open "$APP_DEST"
+  ok "installiert: $APP_DEST"
+  have_app=1
+elif command -v swiftc >/dev/null; then
   zsh "$HERE/app/build.sh" | sed 's/^/    /'
+  have_app=1
+else
+  print "    ⚠︎ swiftc fehlt – App übersprungen. Installieren mit: xcode-select --install"
+fi
+if (( have_app )); then
   APP_AGENT="$HOME/Library/LaunchAgents/com.user.ssd-backup-app.plist"
   if [[ ! -f "$APP_AGENT" ]]; then
     cat > "$APP_AGENT" <<EOF
@@ -138,9 +180,9 @@ if command -v swiftc >/dev/null; then
 EOF
   fi
   ok "App startet beim Anmelden (abschaltbar im App-Menü ⚙︎)"
-else
-  print "    ⚠︎ swiftc fehlt – App übersprungen. Installieren mit: xcode-select --install"
 fi
+
+if (( UPDATE )); then print -P "\n%F{green}Update fertig – Version $("$CMD" version).%f"; exit 0; fi
 
 print -P "\n%F{green}Fertig!%f"
 print "  Hilfe:                       ssd-backup help"

@@ -258,10 +258,16 @@ final class BackupModel: ObservableObject {
     @Published var draft = SettingsDraft()
     @Published var settingsMessage: String?
     @Published var applying = false
+    /// Neuere Version auf GitHub (aus "update_available", geschrieben von `ssd-backup update --check`)
+    @Published var updateVersion: String?
+    @Published var updating = false
+    @Published var checkingUpdate = false
+    let appVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
 
     var savedSettings: SettingsDraft { SettingsDraft(settings) }
 
     private var timer: Timer?
+    private var updateTimer: Timer?
     private var mountProcess: Process?
 
     var selectedSource: BackupSource? { sources.first { $0.id == selectedSourceID } ?? sources.first }
@@ -272,6 +278,56 @@ final class BackupModel: ObservableObject {
         timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.refresh() }
         }
+        // kurz nach dem Start und dann alle 6 Stunden auf Updates prüfen
+        DispatchQueue.main.asyncAfter(deadline: .now() + 20) { [weak self] in self?.checkForUpdate() }
+        updateTimer = Timer.scheduledTimer(withTimeInterval: 6 * 3600, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.checkForUpdate() }
+        }
+    }
+
+    // MARK: Updates
+
+    func checkForUpdate(manual: Bool = false) {
+        guard !cliMissing, !checkingUpdate, !updating else { return }
+        checkingUpdate = true
+        DispatchQueue.global().async {
+            let r = runCLI(["update", "--check"])
+            Task { @MainActor in
+                self.checkingUpdate = false
+                self.refresh()
+                guard manual else { return }
+                switch r.status {
+                case 0: self.message = "Version \(self.updateVersion ?? "") ist verfügbar."
+                case 1: self.message = "Du hast die neueste Version (\(self.appVersion))."
+                default: self.message = "Update-Prüfung fehlgeschlagen: " + r.output.trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+            }
+        }
+    }
+
+    func installUpdate() {
+        guard !isRunning else { message = "Während ein Backup läuft, kann nicht aktualisiert werden."; return }
+        updating = true
+        message = "Update wird installiert – die App startet danach neu."
+        // Ausgabe nicht über eine Pipe lesen: install.sh beendet diese App
+        // und läuft danach weiter (eine Pipe würde sie dann abbrechen).
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        p.arguments = [Paths.cli, "update"]
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        p.terminationHandler = { proc in
+            Task { @MainActor in
+                self.updating = false
+                self.refresh()
+                switch proc.terminationStatus {
+                case 0: self.message = nil
+                case 3: self.message = "Es läuft gerade ein Backup – das Update bitte danach starten."
+                default: self.message = "Update fehlgeschlagen – siehe Protokoll."
+                }
+            }
+        }
+        do { try p.run() } catch { updating = false; message = "Update fehlgeschlagen: \(error.localizedDescription)" }
     }
 
     // MARK: Zustand
@@ -355,6 +411,9 @@ final class BackupModel: ObservableObject {
         mounted = fm.fileExists(atPath: Paths.mountPoint + "/snapshots")
         if mounted { mounting = false }
         autostart = fm.fileExists(atPath: Paths.appAgent)
+        let uv = (try? String(contentsOfFile: Paths.stateDir + "/update_available", encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        updateVersion = (uv?.isEmpty ?? true) || uv == appVersion ? nil : uv
     }
 
     static func settingValue(_ line: Substring, key: String) -> String? {
@@ -640,6 +699,17 @@ struct StatusView: View {
 
             stateCard
 
+            if let v = m.updateVersion {
+                HStack {
+                    Image(systemName: "arrow.down.circle.fill").foregroundStyle(Color.accentColor)
+                    Text("Version \(v) ist verfügbar").font(.callout)
+                    Spacer()
+                    Button(m.updating ? "Wird installiert …" : "Aktualisieren") { m.installUpdate() }
+                        .disabled(m.updating || m.isRunning)
+                }
+                .padding(8).background(Color.accentColor.opacity(0.12), in: RoundedRectangle(cornerRadius: 6))
+            }
+
             if let msg = m.message {
                 HStack(alignment: .top) {
                     Image(systemName: "info.circle")
@@ -707,6 +777,10 @@ struct StatusView: View {
                         openWindow(id: "settings"); NSApp.activate(ignoringOtherApps: true)
                     }
                     Button("Zeitplan …") { m.show(pane: "schedule"); openWindow(id: "settings"); NSApp.activate(ignoringOtherApps: true) }
+                    Divider()
+                    Button(m.checkingUpdate ? "Suche nach Updates …" : "Nach Updates suchen") { m.checkForUpdate(manual: true) }
+                        .disabled(m.checkingUpdate || m.updating)
+                    Text("Version \(m.appVersion)")
                     Divider()
                     Button("App beenden") { NSApp.terminate(nil) }
                 } label: { Image(systemName: "gearshape") }
