@@ -20,6 +20,7 @@ STATE_DIR="$HOME/Library/Application Support/ssd-backup"
 STATUS_FILE="$STATE_DIR/status"
 LOG_FILE="$HOME/Library/Logs/ssd-backup.log"
 LOCK_DIR="$STATE_DIR/lock"
+STORAGE_FILE="$STATE_DIR/storage"       # letzte Messung des pCloud-Speichers (+ .json)
 
 # Systemordner, die nie gesichert werden
 SYSTEM_EXCLUDES=(
@@ -59,9 +60,14 @@ RUN_ON_MOUNT=1                   # beim Einstecken der SSD starten
 SCHEDULE="interval"              # interval | daily | none
 INTERVAL_HOURS=1                 # bei interval: alle X Stunden versuchen
 DAILY_TIME="03:00"               # bei daily: Uhrzeit
+
+# Speicher auf pCloud
+MAX_REPO_GB=0                    # Höchstgröße des Backups in GB (0 = kein Limit)
+MIN_FREE_GB=10                   # so viel muss im pCloud-Konto frei bleiben
 EOF
   # Standardwerte für Einstellungen, die in älteren settings.conf fehlen
   RUN_ON_MOUNT=1 SCHEDULE=interval INTERVAL_HOURS=1 DAILY_TIME="03:00"
+  MAX_REPO_GB=0 MIN_FREE_GB=10
   source "$SETTINGS"
   export RESTIC_REPOSITORY="rclone:${RCLONE_REMOTE}:${REPO_PATH}"
   export RESTIC_PASSWORD_COMMAND="${PASSWORD_COMMAND:-security find-generic-password -a $USER -s $KEYCHAIN_SERVICE -w}"
@@ -405,6 +411,70 @@ build_backup_args() {
 # ---------------------------------------------------------------------------
 #  Backup ausführen:  ssd-backup run [--force]
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+#  Speicher auf pCloud
+# ---------------------------------------------------------------------------
+# Misst Konto (rclone about, ~0,3 s) und – mit --repo oder beim ersten Mal –
+# die echte Größe des Backups (rclone size, zählt alle Dateien, einige Sek.).
+# Ohne --repo wird die Backup-Größe aus der letzten Messung plus dem Zuwachs
+# des Kontos geschätzt. Ergebnis in ST und $STORAGE_FILE(.json).
+storage_refresh() {
+  local about sz; local -a a
+  typeset -gA ST; ST=()
+  [[ -f "$STORAGE_FILE" ]] && source "$STORAGE_FILE" 2>/dev/null
+  about=$(command rclone about "$RCLONE_REMOTE:" --json 2>/dev/null) || return 1
+  a=("${(@f)$(jq -r '.total//0, .used//0, .free//0' <<<"$about")}")
+  [[ ${a[1]} == <-> && ${a[3]} == <-> ]] || return 1
+  ST[total]=${a[1]} ST[used]=${a[2]} ST[free]=${a[3]} ST[checked]=$(now)
+  if [[ "$1" == --repo || -z "${ST[repo_base]}" ]]; then
+    sz=$(command rclone size "$RCLONE_REMOTE:$REPO_PATH" --json --fast-list 2>/dev/null) || return 1
+    ST[repo_base]=$(jq -r '.bytes//0' <<<"$sz") ST[used_base]=${ST[used]} ST[measured]=$(now)
+  fi
+  ST[repo]=$(( ST[repo_base] + ST[used] - ST[used_base] ))
+  (( ST[repo] < 0 )) && ST[repo]=0
+  ST[limit]=$(( ${MAX_REPO_GB:-0} * 1000000000 )) ST[reserve]=$(( ${MIN_FREE_GB:-0} * 1000000000 ))
+  print -r -- "typeset -gA ST=( ${(@kvqq)ST} )" > "$STORAGE_FILE"
+  jq -n '$ARGS.positional as $a | reduce range(0; $a|length; 2) as $i ({}; .[$a[$i]] = ($a[$i+1] | tonumber? // $a[$i+1]))' \
+     --args "${(@kv)ST}" > "$STORAGE_FILE.json.tmp" 2>/dev/null && mv "$STORAGE_FILE.json.tmp" "$STORAGE_FILE.json"
+}
+
+# Ist kein Platz mehr? Gibt die Meldung aus (Exit 0 = Problem).
+storage_problem() {
+  if (( ST[limit] > 0 && ST[repo] >= ST[limit] )); then
+    print -r -- "Speicherlimit erreicht: Backup belegt $(hbytes ${ST[repo]}) von $(hbytes ${ST[limit]})"; return 0
+  fi
+  if (( ST[reserve] > 0 && ST[free] < ST[reserve] )); then
+    print -r -- "pCloud fast voll: nur noch $(hbytes ${ST[free]}) frei (Reserve: $(hbytes ${ST[reserve]}))"; return 0
+  fi
+  return 1
+}
+
+# Wird es knapp? (≥ 90 % vom Limit oder weniger als die doppelte Reserve frei)
+storage_warning() {
+  if (( ST[limit] > 0 && ST[repo] * 10 >= ST[limit] * 9 )); then
+    print -r -- "Speicher fast ausgeschöpft: Backup belegt $(hbytes ${ST[repo]}) von $(hbytes ${ST[limit]})"; return 0
+  fi
+  if (( ST[reserve] > 0 && ST[free] < 2 * ST[reserve] )); then
+    print -r -- "pCloud wird knapp: nur noch $(hbytes ${ST[free]}) frei"; return 0
+  fi
+  return 1
+}
+
+cmd_storage() {
+  storage_refresh --repo || { print -u2 "pCloud-Speicher konnte nicht abgefragt werden (Internet?)."; return 2; }
+  [[ "$1" == --json ]] && { cat "$STORAGE_FILE.json"; return 0; }
+  print -r -- "pCloud-Konto  $(hbytes ${ST[used]}) von $(hbytes ${ST[total]}) belegt · $(hbytes ${ST[free]}) frei"
+  if (( ST[limit] > 0 )); then
+    print -r -- "Backup        $(hbytes ${ST[repo]}) von $(hbytes ${ST[limit]}) (Limit, $(( ST[repo] * 100 / ST[limit] )) %)"
+  else
+    print -r -- "Backup        $(hbytes ${ST[repo]}) (kein Limit – ssd-backup set MAX_REPO_GB 500)"
+  fi
+  (( ST[reserve] > 0 )) && print -r -- "Reserve       $(hbytes ${ST[reserve]}) bleiben im Konto frei"
+  local m; m=$(storage_problem) && print -r -- "⚠︎ $m"
+  m=$(storage_warning) && ! storage_problem >/dev/null && print -r -- "⚠︎ $m"
+  return 0
+}
+
 fail() {
   log "FEHLER: $1"
   load_status; S[state]=error; S[message]="$1"; S[finished]=$(now); save_status
@@ -414,8 +484,9 @@ fail() {
 
 # Ein restic-Backup mit Fortschrittsanzeige ausführen; Rückgabe = restic-Exitcode
 do_backup() {
-  local line milestone=0 pct rc
+  local line milestone=0 pct rc last_st=$(now)
   local -a f
+  STORAGE_ABORT=""
   S[phase]=backup; S[percent]=0; S[eta]=0; save_status
   export RESTIC_PROGRESS_FPS=0.5   # alle 2 s ein Status
   restic backup --json --tag "$SRC_TAG" --group-by host,tags \
@@ -431,6 +502,16 @@ do_backup() {
         S[total_files]=${f[2]} S[files_done]=${f[3]} S[total_bytes]=${f[4]}
         S[bytes_done]=${f[5]} S[elapsed]=${f[6]} S[eta]=${f[7]} S[current]=${f[8]}
         save_status
+        # Speicher auf pCloud laufend überwachen – lieber sauber anhalten als volllaufen
+        if [[ -z "$STORAGE_ABORT" ]] && (( $(now) - last_st >= ${STORAGE_CHECK_SECONDS:-120} )); then
+          last_st=$(now)
+          if storage_refresh && STORAGE_ABORT=$(storage_problem); then
+            log "SPEICHER: $STORAGE_ABORT – Backup wird angehalten"
+            pkill -INT -f "backup --json --tag $SRC_TAG --group-by" 2>/dev/null
+          else
+            STORAGE_ABORT=""
+          fi
+        fi
         pct=${S[percent]%.*}
         if (( NOTIFY_PROGRESS && pct >= milestone + 25 && pct < 100 )); then
           milestone=$(( pct / 25 * 25 ))
@@ -451,6 +532,7 @@ do_backup() {
   done
   rc=${pipestatus[1]}   # (nicht "local rc=…" – das setzt pipestatus zurück)
   cat "$STATE_DIR/backup.err" >> "$LOG_FILE" 2>/dev/null
+  [[ -n "$STORAGE_ABORT" ]] && return 90
   # Exit 3 nur wegen "storing the file again" (Daten nach Reparatur neu hochgeladen)
   # ist kein Lesefehler – das Backup ist vollständig.
   if (( rc == 3 )); then
@@ -608,6 +690,31 @@ cmd_run() {
   done
   remove_stale_locks >/dev/null
 
+  local -a forget_args=(--group-by host,tags
+      --keep-daily $KEEP_DAILY --keep-weekly $KEEP_WEEKLY
+      --keep-monthly $KEEP_MONTHLY --keep-yearly $KEEP_YEARLY)
+
+  # --- ist auf pCloud genug Platz? -------------------------------------------
+  if (( ! check_only )); then
+    if storage_refresh --repo; then
+      local sp
+      if sp=$(storage_problem); then
+        log "SPEICHER: $sp"
+        if ! backup_is_mounted; then
+          # zuerst mit den Aufbewahrungsregeln Platz schaffen
+          S[phase]=cleanup; save_status
+          log "Alte Stände entfernen + prune, um Platz zu schaffen"
+          restic forget "${forget_args[@]}" --prune >> "$LOG_FILE" 2>&1 && date +%s > "$STATE_DIR/last_prune"
+          storage_refresh --repo
+        fi
+        sp=$(storage_problem) && fail "$sp – ältere Stände löschen (Einstellungen → Speicher & Stände) oder Limit erhöhen"
+        log "Nach dem Aufräumen ist wieder genug Platz"
+      fi
+    else
+      log "WARNUNG: pCloud-Speicher konnte nicht abgefragt werden – Backup läuft ohne Speicherprüfung"
+    fi
+  fi
+
   # --- nur die übersprungene Prüfung nachholen (kein neues Backup) --------
   if (( check_only )); then
     log "Übersprungene Prüfung wird nachgeholt"
@@ -669,6 +776,12 @@ cmd_run() {
 
     do_backup; rc=$?
 
+    if (( rc == 90 )); then
+      # Speicher voll/Limit erreicht: diese und alle weiteren Quellen anhalten
+      source_result error "$STORAGE_ABORT – angehalten (Hochgeladenes bleibt erhalten)"
+      notify "Angehalten" "$STORAGE_ABORT"
+      break
+    fi
     # Platte während des Backups abgezogen? Dann ist der Stand unvollständig.
     if ! src_present; then
       source_result warning "Während des Backups entfernt – wird beim nächsten Einstecken fortgesetzt" 0
@@ -707,9 +820,6 @@ cmd_run() {
   date +%s > "$STATE_DIR/last_success"
 
   # --- Aufräumen (gilt für alle Quellen, je Stichwort getrennt) -----------
-  local -a forget_args=(--group-by host,tags
-      --keep-daily $KEEP_DAILY --keep-weekly $KEEP_WEEKLY
-      --keep-monthly $KEEP_MONTHLY --keep-yearly $KEEP_YEARLY)
   S[state]=running; S[phase]=cleanup; save_status
   if (( v == 4 )); then
     log "Aufräumen übersprungen (Backup ist eingehängt)"
@@ -730,6 +840,16 @@ cmd_run() {
     else
       touch "$STATE_DIR/needs_repair"
       fail "Integritätsprüfung hat Probleme gefunden – Reparatur beim nächsten Lauf"
+    fi
+  fi
+
+  # --- Speicher nachmessen, rechtzeitig warnen ----------------------------
+  if storage_refresh --repo; then
+    local sw
+    if sw=$(storage_problem || storage_warning); then
+      log "SPEICHER: $sw"
+      final_state=$(worse $final_state warning)
+      final_msg="${final_msg:+$final_msg; }$sw"
     fi
   fi
 
@@ -864,7 +984,7 @@ cmd_status() {
 # ---------------------------------------------------------------------------
 SETTABLE_KEYS=(MIN_HOURS_BETWEEN KEEP_DAILY KEEP_WEEKLY KEEP_MONTHLY KEEP_YEARLY
   PRUNE_EVERY_DAYS CHECK_EVERY_DAYS NOTIFICATIONS NOTIFY_PROGRESS RCLONE_CONNECTIONS
-  RUN_ON_MOUNT SCHEDULE INTERVAL_HOURS DAILY_TIME)
+  RUN_ON_MOUNT SCHEDULE INTERVAL_HOURS DAILY_TIME MAX_REPO_GB MIN_FREE_GB)
 
 cmd_set() {   # ssd-backup set KEY WERT [KEY WERT …]
   (( $# >= 2 && $# % 2 == 0 )) || { print "Aufruf: ssd-backup set SCHLÜSSEL WERT …" >&2; return 1; }
@@ -1017,6 +1137,54 @@ cmd_update() {
   return $rc
 }
 
+# ---------------------------------------------------------------------------
+#  Stände (Snapshots) manuell löschen
+# ---------------------------------------------------------------------------
+# ssd-backup delete [--no-prune] ID …   (IDs: ssd-backup snapshots)
+cmd_delete() {
+  local prune=1 oldpid rc=0
+  [[ "$1" == --no-prune ]] && { prune=0; shift; }
+  (( $# )) || { print -u2 "Aufruf: ssd-backup delete [--no-prune] STAND-ID …   (IDs zeigt: ssd-backup snapshots)"; return 1; }
+  if backup_is_mounted; then
+    print -u2 "Das Backup ist gerade im Finder eingehängt – erst aushängen (⏏︎ in der App)."; return 4
+  fi
+  if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    oldpid=$(cat "$LOCK_DIR/pid" 2>/dev/null)
+    if [[ -n "$oldpid" ]] && kill -0 "$oldpid" 2>/dev/null; then
+      print -u2 "Es läuft gerade ein Backup – bitte danach löschen."; return 3
+    fi
+    rm -rf "$LOCK_DIR"; mkdir "$LOCK_DIR"
+  fi
+  print $$ > "$LOCK_DIR/pid"
+  load_status; typeset -gA PREV_S; PREV_S=("${(@kv)S}")
+  trap 'rm -rf "$LOCK_DIR"' EXIT
+  trap 'pkill -TERM -P $$ 2>/dev/null; S=("${(@kv)PREV_S}"); save_status; log "Löschen abgebrochen"; exit 130' INT TERM HUP
+  caffeinate -i -w $$ &!
+
+  S=(state running phase delete started $(now) pid $$ percent 0 message "" sources "$# Stände")
+  save_status
+  log "=== Stände löschen: $*"
+  remove_stale_locks >/dev/null
+  if ! restic forget "$@" >> "$LOG_FILE" 2>&1; then
+    log "FEHLER: Löschen fehlgeschlagen"
+    S=("${(@kv)PREV_S}"); save_status
+    print -u2 "Löschen fehlgeschlagen – siehe Protokoll (ssd-backup log)."; return 1
+  fi
+  if (( prune )); then
+    S[phase]=prune; save_status
+    log "Speicher auf pCloud freigeben (prune)"
+    if restic prune >> "$LOG_FILE" 2>&1; then date +%s > "$STATE_DIR/last_prune"
+    else log "WARNUNG: prune fehlgeschlagen – wird beim nächsten Aufräumen nachgeholt"; rc=5; fi
+  fi
+  storage_refresh --repo
+  S=("${(@kv)PREV_S}"); save_status      # Anzeige wieder auf den letzten Backup-Lauf
+  log "=== $# Stände gelöscht"
+  if (( rc )); then print "Gelöscht: $# Stände (Speicher wird beim nächsten Aufräumen freigegeben)."
+  elif (( prune )); then print "Gelöscht: $# Stände – Backup belegt jetzt $(hbytes ${ST[repo]})."
+  else print "Gelöscht: $# Stände (Speicher wird beim nächsten Aufräumen freigegeben)."; fi
+  return 0
+}
+
 cmd_help() {
   cat <<'EOF'
 ssd-backup – verschlüsseltes Backup von Platten/Ordnern nach pCloud
@@ -1048,7 +1216,10 @@ ssd-backup – verschlüsseltes Backup von Platten/Ordnern nach pCloud
   ssd-backup update [--check]  auf neue Version prüfen und installieren
   ssd-backup version           installierte Version anzeigen
 
-  ssd-backup snapshots         alle gesicherten Stände
+  ssd-backup snapshots [--json]  alle gesicherten Stände
+  ssd-backup delete ID …       Stände löschen und Speicher freigeben (--no-prune: nur löschen)
+  ssd-backup storage [--json]  pCloud-Speicher und Größe des Backups anzeigen
+  ssd-backup set MAX_REPO_GB 500   Backup auf 500 GB begrenzen (0 = kein Limit)
   ssd-backup log               Protokoll live ansehen
   ssd-backup restic …          beliebiger restic-Befehl mit dem Backup,
                                z. B.: ssd-backup restic restore latest --target ~/Desktop/restore --include "/Volumes/…/Fotos"
@@ -1069,7 +1240,9 @@ case $cmd in
   sources)            cmd_source list ;;
   source|src)         cmd_source "$@" ;;
   edit)               open -t "$SETTINGS" "$SOURCES_DIR"/*/source.conf(N) "$SOURCES_DIR"/*/include.txt(N) "$SOURCES_DIR"/*/exclude.txt(N) ;;
-  snapshots|snap)     restic snapshots ;;
+  snapshots|snap)     if [[ "$1" == --json ]]; then restic snapshots --json; else restic snapshots "$@"; fi ;;
+  delete|forget)      cmd_delete "$@" ;;
+  storage|space)      cmd_storage "$@" ;;
   log)                tail -n 40 -f "$LOG_FILE" ;;
   restic)             restic "$@" ;;
   start)              # Backup über launchd starten (läuft unabhängig vom Terminal/der App)

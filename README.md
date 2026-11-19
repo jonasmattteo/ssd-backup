@@ -20,6 +20,8 @@ entpacken und im Terminal `zsh install.sh` im entpackten Ordner ausführen.
 
 ## Aktualisieren
 
+Was sich in jeder Version geändert hat, steht im [Changelog](CHANGELOG.md).
+
 Die App prüft alle 6 Stunden auf neue Versionen und zeigt dann
 **„Version X ist verfügbar – Aktualisieren“**. Manuell: ⚙︎ → **Nach Updates suchen**,
 oder im Terminal:
@@ -53,6 +55,8 @@ und startet sie beim Anmelden. Ein Klick auf das Laufwerk-Symbol oben rechts zei
   - **Quellen**: Platten/Ordner hinzufügen (+) oder entfernen (−); je Quelle
     gesicherte und ausgeschlossene Ordner, „Automatisch sichern“, „Jetzt sichern“
   - **Zeitplan**: beim Einstecken, alle X Stunden oder täglich, Mindestabstand, pausieren
+  - **Speicher & Stände**: Belegung auf pCloud, Größenlimit, Reserve; alle
+    gesicherten Stände mit der Möglichkeit, einzelne zu löschen
   - **Aufbewahrung & Weiteres**: Stände behalten, Mitteilungen, Autostart, Uploads
 - **Protokoll**, ⚙︎ als Abkürzung zu Quellen, Zeitplan, Pausieren, Updates und Beenden
 
@@ -193,6 +197,33 @@ Aufbewahrt werden 7 tägliche, 4 wöchentliche, 12 monatliche und 3 jährliche
 Stände. Einmal pro Woche werden alte Daten endgültig entfernt, einmal im Monat
 wird eine 5-%-Stichprobe auf Integrität geprüft.
 
+## Speicher auf pCloud
+
+Das Menü zeigt, wie groß das Backup ist und wie viel im pCloud-Konto noch frei
+ist. Unter **Einstellungen → Speicher & Stände** lässt sich festlegen:
+
+- **Größe des Backups begrenzen**: Höchstgröße in GB (`MAX_REPO_GB`, 0 = kein Limit)
+- **Im Konto frei lassen**: Reserve, die nie belegt wird (`MIN_FREE_GB`, Standard 10 GB)
+
+Der Speicher wird **vor jedem Backup und währenddessen alle 2 Minuten** geprüft
+(`rclone about`, ein schneller Aufruf). Wird eine Grenze erreicht, entfernt das
+Backup zuerst alte Stände nach den Aufbewahrungsregeln. Reicht das nicht, hält
+es sauber an und meldet „Speicherlimit erreicht“. Bereits Hochgeladenes bleibt
+erhalten und wird beim nächsten Lauf weiterverwendet. Ab 90 % gibt es eine Warnung.
+
+**Stände löschen:** Auf derselben Seite stehen alle gesicherten Stände mit
+Datum, Quelle und neu hochgeladener Datenmenge. Ausgewählte Stände lassen sich
+löschen, danach wird der Speicher freigegeben (`restic prune`, kann einige
+Minuten dauern). Während ein Backup läuft oder das Backup im Finder
+eingehängt ist, geht das nicht.
+
+```bash
+ssd-backup storage              # Konto, Backup-Größe, Limit
+ssd-backup set MAX_REPO_GB 500  # Limit setzen (0 = aus)
+ssd-backup snapshots            # Stände mit ID
+ssd-backup delete 2fb18f40      # Stand löschen + Speicher freigeben
+```
+
 ## Wiederherstellen & Weiteres
 
 | Was | Befehl |
@@ -203,7 +234,8 @@ wird eine 5-%-Stichprobe auf Integrität geprüft.
 | Ordner zurückholen | `ssd-backup restic restore latest --target ~/Desktop/restore --include "/Volumes/MeineSSD/Fotos/2025"` |
 | Alles auf eine neue Platte | `ssd-backup restic restore latest --target /Volumes/NeuePlatte` |
 | Backup wie ein Laufwerk durchstöbern* | `ssd-backup restic mount ~/restic-mount` |
-| Speicherverbrauch in pCloud | `ssd-backup restic stats --mode raw-data` |
+| Speicherverbrauch in pCloud | `ssd-backup storage` |
+| Stand löschen | `ssd-backup delete ID` |
 
 \* braucht macFUSE (`brew install --cask macfuse`).
 
@@ -223,10 +255,12 @@ bleiben erhalten.)
 Aus dem Git-Checkout installieren: `zsh install.sh` (baut die App selbst,
 braucht dafür `xcode-select --install`).
 
-Neue Version veröffentlichen (braucht `gh auth login`):
+Neue Version veröffentlichen (braucht `gh auth login`): zuerst im
+`CHANGELOG.md` einen Abschnitt `## [1.2.0] – Datum` anlegen, dann:
 ```bash
 ./release.sh 1.2.0 --publish
 ```
 Das setzt die Versionsnummer, baut die App für beide Prozessoren, packt
-`ssd-backup-1.2.0.zip`, taggt `v1.2.0` und legt das GitHub-Release an.
+`ssd-backup-1.2.0.zip`, taggt `v1.2.0` und legt das GitHub-Release an. Der
+Changelog-Abschnitt wird zu den Release-Notizen.
 Ohne `--publish` landet das Paket nur in `dist/`.

@@ -15,6 +15,7 @@ enum Paths {
     static let stateDir = home + "/Library/Application Support/ssd-backup"
     static let statusJSON = stateDir + "/status.json"
     static let lastRunJSON = stateDir + "/last_run.json"
+    static let storageJSON = stateDir + "/storage.json"
     static let lastSuccess = stateDir + "/last_success"
     static let sourcesState = stateDir + "/sources"
     static let paused = stateDir + "/paused"
@@ -26,13 +27,13 @@ enum Paths {
 
 /// Führt `ssd-backup <args>` aus und liefert die Ausgabe.
 @discardableResult
-func runCLI(_ args: [String]) -> (status: Int32, output: String) {
+func runCLI(_ args: [String], includeStderr: Bool = true) -> (status: Int32, output: String) {
     let p = Process()
     p.executableURL = URL(fileURLWithPath: "/bin/zsh")
     p.arguments = [Paths.cli] + args
     let pipe = Pipe()
     p.standardOutput = pipe
-    p.standardError = pipe
+    p.standardError = includeStderr ? pipe : FileHandle.nullDevice
     do { try p.run() } catch { return (-1, error.localizedDescription) }
     let data = pipe.fileHandleForReading.readDataToEndOfFile()
     p.waitUntilExit()
@@ -43,6 +44,10 @@ func readJSON(_ path: String) -> [String: String] {
     guard let d = FileManager.default.contents(atPath: path),
           let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else { return [:] }
     return o.mapValues { "\($0)" }
+}
+
+func fmtBytes(_ v: Double) -> String {
+    ByteCountFormatter.string(fromByteCount: Int64(v), countStyle: .decimal)
 }
 
 func fmtBytes(_ s: String?) -> String {
@@ -135,8 +140,39 @@ struct ListFile {
 
 // MARK: - Quellen (Platten/Ordner)
 
+/// Ein gesicherter Stand (restic-Snapshot)
+struct SnapshotInfo: Identifiable, Equatable {
+    let id: String
+    let shortID: String
+    let time: Date
+    let tag: String
+    let host: String
+    let dataAdded: Double?
+    let totalBytes: Double?
+    let files: Int?
+
+    static func parse(_ json: String) -> [SnapshotInfo]? {
+        guard let start = json.firstIndex(of: "["),
+              let arr = try? JSONSerialization.jsonObject(with: Data(json[start...].utf8)) as? [[String: Any]] else { return nil }
+        let iso = ISO8601DateFormatter()
+        return arr.compactMap { o in
+            guard let id = o["id"] as? String, let t = o["time"] as? String else { return nil }
+            // restic liefert Nanosekunden – die versteht ISO8601DateFormatter nicht
+            let plain = t.replacingOccurrences(of: #"\.\d+"#, with: "", options: .regularExpression)
+            guard let date = iso.date(from: plain) else { return nil }
+            let sum = o["summary"] as? [String: Any]
+            return SnapshotInfo(id: id, shortID: o["short_id"] as? String ?? String(id.prefix(8)), time: date,
+                                tag: (o["tags"] as? [String])?.first ?? "", host: o["hostname"] as? String ?? "",
+                                dataAdded: (sum?["data_added"] as? NSNumber)?.doubleValue,
+                                totalBytes: (sum?["total_bytes_processed"] as? NSNumber)?.doubleValue,
+                                files: (sum?["total_files_processed"] as? NSNumber)?.intValue)
+        }.sorted { $0.time > $1.time }
+    }
+}
+
 struct BackupSource: Identifiable, Equatable {
     let id: String
+    var tag: String = ""
     var name: String
     var root: String
     var enabled: Bool
@@ -187,7 +223,7 @@ struct BackupSource: Identifiable, Equatable {
             var last: Date?
             if let t = try? String(contentsOfFile: state + "/last_success", encoding: .utf8),
                let ts = Double(t.trimmingCharacters(in: .whitespacesAndNewlines)) { last = Date(timeIntervalSince1970: ts) }
-            return BackupSource(id: id, name: value(text, "NAME") ?? id, root: root,
+            return BackupSource(id: id, tag: value(text, "TAG") ?? id, name: value(text, "NAME") ?? id, root: root,
                                 enabled: (value(text, "ENABLED") ?? "1") != "0", connected: connected,
                                 includes: ListFile(path: Paths.sourcesDir + "/\(id)/include.txt").entries(),
                                 excludes: ListFile(path: Paths.sourcesDir + "/\(id)/exclude.txt").entries(),
@@ -207,6 +243,7 @@ struct SettingsDraft: Equatable {
     var keepDaily = 7, keepWeekly = 4, keepMonthly = 12, keepYearly = 3
     var notifications = true, notifyProgress = true
     var connections = 2
+    var maxRepoGB = 0, minFreeGB = 10
 
     init() {}
     init(_ s: [String: String]) {
@@ -221,6 +258,7 @@ struct SettingsDraft: Equatable {
         notifications = i("NOTIFICATIONS", 1) != 0
         notifyProgress = i("NOTIFY_PROGRESS", 1) != 0
         connections = i("RCLONE_CONNECTIONS", 2)
+        maxRepoGB = i("MAX_REPO_GB", 0); minFreeGB = i("MIN_FREE_GB", 10)
     }
 
     var pairs: [String] {
@@ -230,7 +268,8 @@ struct SettingsDraft: Equatable {
          "KEEP_DAILY", "\(keepDaily)", "KEEP_WEEKLY", "\(keepWeekly)",
          "KEEP_MONTHLY", "\(keepMonthly)", "KEEP_YEARLY", "\(keepYearly)",
          "NOTIFICATIONS", notifications ? "1" : "0", "NOTIFY_PROGRESS", notifyProgress ? "1" : "0",
-         "RCLONE_CONNECTIONS", "\(connections)"]
+         "RCLONE_CONNECTIONS", "\(connections)",
+         "MAX_REPO_GB", "\(max(0, maxRepoGB))", "MIN_FREE_GB", "\(max(0, minFreeGB))"]
     }
 
     func scheduleDiffers(from o: SettingsDraft) -> Bool {
@@ -293,6 +332,15 @@ final class BackupModel: ObservableObject {
     @Published var applying = false
     /// Neuere Version auf GitHub (aus "update_available", geschrieben von `ssd-backup update --check`)
     @Published var updateVersion: String?
+    /// letzte Speichermessung (storage.json): total, used, free, repo, limit, reserve, measured
+    @Published var storage: [String: Double] = [:]
+    @Published var measuring = false
+    @Published var snapshots: [SnapshotInfo] = []
+    @Published var snapSel = Set<String>()
+    @Published var snapLoading = false
+    @Published var snapLoaded = false
+    @Published var snapMessage: String?
+    @Published var deleting = false
     @Published var updating = false
     @Published var checkingUpdate = false
     let appVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
@@ -311,10 +359,95 @@ final class BackupModel: ObservableObject {
         timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.refreshInBackground() }
         }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in
+            guard let self, self.storage["repo"] == nil else { return }
+            self.measureStorage()
+        }
         // kurz nach dem Start und dann alle 6 Stunden auf Updates prüfen
         DispatchQueue.main.asyncAfter(deadline: .now() + 20) { [weak self] in self?.checkForUpdate() }
         updateTimer = Timer.scheduledTimer(withTimeInterval: 6 * 3600, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.checkForUpdate() }
+        }
+    }
+
+    // MARK: Speicher & Stände
+
+    func measureStorage() {
+        guard !cliMissing, !measuring else { return }
+        measuring = true
+        DispatchQueue.global().async {
+            let r = runCLI(["storage"])
+            Task { @MainActor in
+                self.measuring = false
+                if r.status != 0 { self.snapMessage = r.output.trimmingCharacters(in: .whitespacesAndNewlines) }
+                self.refresh()
+            }
+        }
+    }
+
+    func measureStorageIfOld() {
+        let measured = storage["measured"] ?? 0
+        if Date().timeIntervalSince1970 - measured > 3600 { measureStorage() }
+    }
+
+    func sourceName(forTag tag: String) -> String {
+        sources.first { $0.tag == tag }?.name ?? (tag.isEmpty ? "–" : tag)
+    }
+
+    func loadSnapshots() {
+        guard !cliMissing, !snapLoading else { return }
+        snapLoading = true
+        DispatchQueue.global().async {
+            let r = runCLI(["snapshots", "--json"], includeStderr: false)
+            let list = SnapshotInfo.parse(r.output)
+            Task { @MainActor in
+                self.snapLoading = false
+                if let list {
+                    self.snapshots = list
+                    self.snapSel = self.snapSel.filter { id in list.contains { $0.id == id } }
+                    self.snapLoaded = true
+                } else {
+                    self.snapMessage = "Stände konnten nicht geladen werden (Internet? Läuft gerade ein Aufräumen?)."
+                }
+            }
+        }
+    }
+
+    func deleteSelectedSnapshots() {
+        let chosen = snapshots.filter { snapSel.contains($0.id) }
+        guard !chosen.isEmpty else { return }
+        if isRunning { snapMessage = "Während ein Backup läuft, kann nicht gelöscht werden."; return }
+        if mounted { snapMessage = "Das Backup ist gerade im Finder eingehängt – erst aushängen (⏏︎)."; return }
+        // neueste Stände einer Quelle besonders erwähnen
+        let newest = Dictionary(grouping: snapshots, by: \.tag).compactMapValues { $0.max { $0.time < $1.time }?.id }
+        let losingNewest = Set(chosen.filter { newest[$0.tag] == $0.id }.map { sourceName(forTag: $0.tag) })
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = chosen.count == 1 ? "1 Stand löschen?" : "\(chosen.count) Stände löschen?"
+        var info = "Die ausgewählten Stände werden aus dem Backup auf pCloud entfernt und der Speicher wird freigegeben. Das lässt sich nicht rückgängig machen.\n\nDas Aufräumen auf pCloud kann einige Minuten dauern; solange startet kein Backup."
+        if !losingNewest.isEmpty {
+            info += "\n\nAchtung: Darunter ist der neueste Stand von \(losingNewest.sorted().joined(separator: ", "))."
+        }
+        alert.informativeText = info
+        let del = alert.addButton(withTitle: "Löschen")
+        del.hasDestructiveAction = true
+        alert.addButton(withTitle: "Abbrechen")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        deleting = true
+        snapMessage = "Lösche \(chosen.count == 1 ? "1 Stand" : "\(chosen.count) Stände") und gebe Speicher frei …"
+        let ids = chosen.map(\.id)
+        DispatchQueue.global().async {
+            let r = runCLI(["delete"] + ids)
+            Task { @MainActor in
+                self.deleting = false
+                let lines = r.output.split(separator: "\n").map(String.init)
+                self.snapMessage = lines.last ?? (r.status == 0 ? "Gelöscht." : "Löschen fehlgeschlagen – siehe Protokoll.")
+                self.snapSel = []
+                self.refresh()
+                self.loadSnapshots()
+            }
         }
     }
 
@@ -396,6 +529,8 @@ final class BackupModel: ObservableObject {
         case "repair": return "Repariere beschädigte Daten"
         case "cleanup": return "Räume alte Stände auf"
         case "check": return "Prüfe Backup (Stichprobe)"
+        case "delete": return "Lösche Stände"
+        case "prune": return "Gebe Speicher auf pCloud frei"
         default: return status["phase"] ?? ""
         }
     }
@@ -424,6 +559,7 @@ final class BackupModel: ObservableObject {
         var mounted = false
         var autostart = false
         var updateVersion: String?
+        var storage: [String: Double] = [:]
     }
 
     nonisolated static func gather() -> Snapshot {
@@ -455,6 +591,7 @@ final class BackupModel: ObservableObject {
         g.autostart = fm.fileExists(atPath: Paths.appAgent)
         g.updateVersion = (try? String(contentsOfFile: Paths.stateDir + "/update_available", encoding: .utf8))?
             .trimmingCharacters(in: .whitespacesAndNewlines)
+        g.storage = readJSON(Paths.storageJSON).compactMapValues { Double($0) }
         return g
     }
 
@@ -482,6 +619,7 @@ final class BackupModel: ObservableObject {
         let uv = g.updateVersion
         let newUV = (uv?.isEmpty ?? true) || uv == appVersion ? nil : uv
         if newUV != updateVersion { updateVersion = newUV }
+        if g.storage != storage { storage = g.storage }
     }
 
     /// Sofort einlesen (nach eigenen Aktionen).
@@ -991,6 +1129,20 @@ struct StatusView: View {
                 Text(m.paused ? "pausiert" : m.savedSettings.scheduleText)
                     .foregroundStyle(m.paused ? .orange : .primary)
             }.font(.caption)
+            if let repo = m.storage["repo"] {
+                let limit = m.storage["limit"] ?? 0
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack {
+                        Text("pCloud").foregroundStyle(.secondary)
+                        Text("Backup \(fmtBytes(repo))" + (limit > 0 ? " von \(fmtBytes(limit))" : "")
+                             + " · \(fmtBytes(m.storage["free"] ?? 0)) frei")
+                    }
+                    if limit > 0 {
+                        ProgressView(value: min(repo / limit, 1))
+                            .tint(repo / limit >= 0.9 ? .orange : .accentColor)
+                    }
+                }.font(.caption)
+            }
         }
         .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -1011,7 +1163,9 @@ struct SettingsWindow: View {
                 if m.pane == "schedule" {
                     SettingsForm(part: .schedule)
                 } else if m.pane == "general" {
-                    SettingsForm(part: .general)
+                    SettingsForm(part: .general).id("general")
+                } else if m.pane == "storage" {
+                    SettingsForm(part: .storage).id("storage")
                 } else if let src = m.sources.first(where: { "source:" + $0.id == m.pane }) {
                     SourceDetail(src: src).id(src.id)
                 } else {
@@ -1056,6 +1210,16 @@ struct SettingsWindow: View {
                         }
                     } icon: { Image(systemName: "clock") }
                     .tag("schedule")
+                    Label {
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text("Speicher & Stände")
+                            if let repo = m.storage["repo"] {
+                                Text(fmtBytes(repo) + ((m.storage["limit"] ?? 0) > 0 ? " von \(fmtBytes(m.storage["limit"] ?? 0))" : ""))
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
+                    } icon: { Image(systemName: "chart.pie") }
+                    .tag("storage")
                     Label("Aufbewahrung & Weiteres", systemImage: "slider.horizontal.3").tag("general")
                 }
             }
@@ -1167,7 +1331,7 @@ struct SourceDetail: View {
 // MARK: Seiten „Zeitplan“ und „Aufbewahrung & Weiteres“
 
 struct SettingsForm: View {
-    enum Part { case schedule, general }
+    enum Part { case schedule, general, storage }
     @EnvironmentObject var m: BackupModel
     let part: Part
     static let minHourOptions = [1, 6, 12, 20, 24, 48, 72, 168]
@@ -1175,9 +1339,19 @@ struct SettingsForm: View {
     var body: some View {
         VStack(spacing: 0) {
             Form {
-                if part == .schedule { scheduleSection } else { generalSections }
+                switch part {
+                case .schedule: scheduleSection
+                case .general: generalSections
+                case .storage: storageSections
+                }
             }
             .formStyle(.grouped)
+            .onAppear {
+                if part == .storage {
+                    m.measureStorageIfOld()
+                    if !m.snapLoaded { m.loadSnapshots() }
+                }
+            }
 
             Divider()
             HStack {
@@ -1223,6 +1397,116 @@ struct SettingsForm: View {
             Text("Zeitplan")
         } footer: {
             Text("Zu diesen Zeitpunkten wird ein Backup versucht – für jede Quelle, die verfügbar ist (externe Platte angesteckt) und deren letztes erfolgreiches Backup länger als der Mindestabstand her ist. Abgebrochene Backups werden beim nächsten Zeitpunkt fortgesetzt. Schläft der Mac zur Uhrzeit, wird es beim Aufwachen nachgeholt. Einzelne Quellen lassen sich auf ihrer Seite von der Automatik ausnehmen.")
+                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    @ViewBuilder var storageSections: some View {
+        let st = m.storage
+        Section {
+            if let total = st["total"], let used = st["used"], total > 0 {
+                LabeledContent("pCloud-Konto") {
+                    Text("\(fmtBytes(used)) von \(fmtBytes(total)) belegt · \(fmtBytes(st["free"] ?? 0)) frei")
+                }
+                ProgressView(value: min(used / total, 1))
+            }
+            if let repo = st["repo"] {
+                let limit = st["limit"] ?? 0
+                LabeledContent("Dieses Backup") {
+                    Text(fmtBytes(repo) + (limit > 0 ? " von \(fmtBytes(limit)) (\(Int(repo / limit * 100)) %)" : ""))
+                }
+                if limit > 0 {
+                    ProgressView(value: min(repo / limit, 1)).tint(repo / limit >= 0.9 ? .orange : .accentColor)
+                }
+            } else {
+                Text("Noch nicht gemessen.").foregroundStyle(.secondary)
+            }
+            HStack {
+                if let t = st["measured"] {
+                    Text("Gemessen \(Date(timeIntervalSince1970: t).formatted(.relative(presentation: .named)))")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+                if m.measuring { ProgressView().controlSize(.small) }
+                Button("Jetzt messen") { m.measureStorage() }.disabled(m.measuring)
+            }
+        } header: {
+            Text("Speicher auf pCloud")
+        }
+
+        Section {
+            Toggle("Größe des Backups begrenzen", isOn: Binding(
+                get: { m.draft.maxRepoGB > 0 },
+                set: { on in m.draft.maxRepoGB = on ? max(50, Int(((st["repo"] ?? 0) / 1e9 * 1.2).rounded(.up))) : 0 }))
+            if m.draft.maxRepoGB > 0 {
+                LabeledContent("Höchstens") {
+                    HStack {
+                        TextField("", value: $m.draft.maxRepoGB, format: .number)
+                            .multilineTextAlignment(.trailing).frame(width: 80).labelsHidden()
+                        Text("GB")
+                        Stepper("", value: $m.draft.maxRepoGB, in: 1...1_000_000, step: 50).labelsHidden()
+                    }
+                }
+            }
+            LabeledContent("Im Konto frei lassen") {
+                HStack {
+                    TextField("", value: $m.draft.minFreeGB, format: .number)
+                        .multilineTextAlignment(.trailing).frame(width: 80).labelsHidden()
+                    Text("GB")
+                    Stepper("", value: $m.draft.minFreeGB, in: 0...10_000, step: 5).labelsHidden()
+                }
+            }
+        } header: {
+            Text("Grenzen")
+        } footer: {
+            Text("Vor jedem Backup und währenddessen alle 2 Minuten wird der Speicher geprüft. Ist das Limit erreicht oder wird es im Konto zu knapp, räumt das Backup zuerst nach den Aufbewahrungsregeln auf und hält sonst sauber an – Hochgeladenes bleibt erhalten. Ab 90 % gibt es eine Warnung.")
+                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+        }
+
+        Section {
+            if m.snapshots.isEmpty {
+                HStack {
+                    if m.snapLoading { ProgressView().controlSize(.small); Text("Lade Stände von pCloud …") }
+                    else { Text(m.snapLoaded ? "Keine Stände vorhanden." : "Noch nicht geladen.") }
+                }.foregroundStyle(.secondary)
+            }
+            ForEach(m.snapshots) { snap in
+                Toggle(isOn: Binding(get: { m.snapSel.contains(snap.id) },
+                                     set: { on in if on { m.snapSel.insert(snap.id) } else { m.snapSel.remove(snap.id) } })) {
+                    HStack {
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(snap.time.formatted(date: .abbreviated, time: .shortened))
+                            Text(m.sourceName(forTag: snap.tag) + " · " + snap.shortID)
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        VStack(alignment: .trailing, spacing: 1) {
+                            if let a = snap.dataAdded { Text("+\(fmtBytes(a)) neu").monospacedDigit() }
+                            if let t = snap.totalBytes {
+                                Text("\(fmtBytes(t)) gesamt").font(.caption).foregroundStyle(.secondary).monospacedDigit()
+                            }
+                        }
+                    }
+                }
+                .toggleStyle(.checkbox)
+                .disabled(m.deleting)
+            }
+            HStack {
+                if let msg = m.snapMessage {
+                    Text(msg).font(.caption).foregroundStyle(.secondary).lineLimit(3)
+                }
+                Spacer()
+                if m.snapLoading || m.deleting { ProgressView().controlSize(.small) }
+                Button("Neu laden") { m.loadSnapshots() }.disabled(m.snapLoading || m.deleting)
+                Button(m.snapSel.isEmpty ? "Löschen …" : "\(m.snapSel.count) löschen …", role: .destructive) {
+                    m.deleteSelectedSnapshots()
+                }
+                .disabled(m.snapSel.isEmpty || m.deleting || m.snapLoading)
+            }
+        } header: {
+            Text("Gesicherte Stände")
+        } footer: {
+            Text("„neu“ = beim jeweiligen Backup hochgeladene Daten. Wie viel das Löschen eines Stands freigibt, hängt davon ab, ob andere Stände dieselben Daten noch brauchen. Alte Stände werden ohnehin nach den Aufbewahrungsregeln automatisch entfernt.")
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
         }
     }
@@ -1306,6 +1590,16 @@ struct SSDBackupApp: App {
             snapWindow(SettingsWindow(), NSSize(width: 820, height: 680), "settings.png")
             m.show(pane: "general")
             snapWindow(SettingsWindow(), NSSize(width: 820, height: 680), "settings2.png")
+            let now = Date()
+            m.snapshots = (0..<5).map { i in
+                SnapshotInfo(id: "id\(i)", shortID: String(format: "a1b2c3%02d", i), time: now.addingTimeInterval(Double(-i) * 86400),
+                             tag: m.sources.first?.tag ?? "ssd", host: "mac", dataAdded: Double(1_200_000_000 / (i + 1)),
+                             totalBytes: 930_000_000_000, files: 120_000)
+            }
+            m.snapLoaded = true
+            m.snapSel = ["id3", "id4"]
+            m.show(pane: "storage")
+            snapWindow(SettingsWindow(), NSSize(width: 820, height: 900), "storage.png")
             exit(0)
         }
     }
