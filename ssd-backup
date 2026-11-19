@@ -8,7 +8,7 @@
 
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
-SSD_BACKUP_VERSION="1.0.1"              # wird von release.sh gesetzt
+SSD_BACKUP_VERSION="1.1.0"              # wird von release.sh gesetzt
 UPDATE_REPO="jonasmattteo/ssd-backup"   # GitHub-Repo für Updates
 
 CONF_DIR="$HOME/.config/ssd-backup"
